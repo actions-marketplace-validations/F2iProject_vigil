@@ -1,6 +1,6 @@
 [project]
 name = "vigil"
-version = "1.0.0"
+version = "0.1.0"
 description = "AI-powered, model-agnostic PR review tool"
 requires-python = ">=3.11"
 license = {text = "MIT"}
