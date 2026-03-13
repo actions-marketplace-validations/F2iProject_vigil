@@ -124,7 +124,7 @@ def _build_review_body(result: ReviewResult, inline_count: int = 0) -> str:
     total = len(result.specialist_verdicts)
     inline_note = f" \u00b7 {inline_count} inline comments" if inline_count else ""
     sections.append(f"---\n*{approvals}/{total} specialists approved \u00b7 {total_findings} findings \u00b7 {len(result.observations)} observations{inline_note}*  ")
-    sections.append("*Reviewed by [Vigil](https://github.com) \u2014 AI-powered, model-agnostic PR review*")
+    sections.append("*Reviewed by [Vigil](https://github.com/F2iProject/vigil) \u2014 AI-powered, model-agnostic PR review*")
 
     return "\n".join(sections)
 

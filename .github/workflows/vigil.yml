@@ -13,7 +13,7 @@ name: Vigil PR Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Cancel in-progress reviews when a new commit is pushed
 concurrency:
@@ -32,7 +32,7 @@ jobs:
       github.event.pull_request.draft == false &&
       github.actor != 'dependabot[bot]'
     steps:
-      - uses: F2iProject/vigil@main
+      - uses: F2iProject/vigil@v1
         with:
           model: "gemini/gemini-2.5-flash"
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
