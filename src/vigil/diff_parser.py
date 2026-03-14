@@ -221,9 +221,8 @@ def find_best_file_for_finding(
         if PurePosixPath(path).name == finding_name and lines:
             return (path, min(lines))
 
-    # Fall back to first file in diff
-    first_file = sorted(valid_lines.keys())[0]
-    first_lines = valid_lines[first_file]
-    if first_lines:
-        return (first_file, min(first_lines))
+    # Fall back to first file in diff that has commentable lines
+    for path in sorted(valid_lines.keys()):
+        if valid_lines[path]:
+            return (path, min(valid_lines[path]))
     return None

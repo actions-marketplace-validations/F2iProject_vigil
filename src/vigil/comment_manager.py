@@ -1,8 +1,10 @@
 """Manage Vigil review comment lifecycle: fetch, resolve, deduplicate."""
 
 import difflib
+import hashlib
 import logging
 import re
+from collections import defaultdict
 
 import httpx
 
@@ -21,6 +23,9 @@ _STRIP_PATTERNS = [
     re.compile(r"\*\*Suggestion:\*\*.*", re.DOTALL),  # suggestion blocks
     re.compile(r"\*Originally for.*?\*\n*"),  # relocation notes
 ]
+
+# Max thread IDs per batch mutation (GitHub GraphQL has a ~500KB payload limit)
+_BATCH_SIZE = 50
 
 
 def _github_headers(token: str) -> dict[str, str]:
@@ -147,26 +152,52 @@ def fetch_review_threads(
 
 
 def resolve_thread_by_node_id(node_id: str, token: str) -> bool:
-    """Resolve a review thread using the GraphQL resolveReviewThread mutation."""
-    mutation = """
-    mutation($threadId: ID!) {
-      resolveReviewThread(input: {threadId: $threadId}) {
-        thread { isResolved }
-      }
-    }
+    """Resolve a single review thread using the GraphQL resolveReviewThread mutation."""
+    resolved = resolve_threads_batch([node_id], token)
+    return len(resolved) == 1
+
+
+def resolve_threads_batch(thread_ids: list[str], token: str) -> list[str]:
+    """Resolve multiple review threads in batched GraphQL mutations.
+
+    Sends up to _BATCH_SIZE mutations per request to avoid N+1 round-trips.
+    Returns list of successfully resolved thread IDs.
     """
-    try:
-        data = _graphql(mutation, {"threadId": node_id}, token)
-        resolved = (
-            data.get("data", {})
-            .get("resolveReviewThread", {})
-            .get("thread", {})
-            .get("isResolved", False)
-        )
-        return resolved
-    except Exception as e:
-        log.warning("Failed to resolve thread %s: %s", node_id, e)
-        return False
+    if not thread_ids:
+        return []
+
+    resolved: list[str] = []
+    for batch_start in range(0, len(thread_ids), _BATCH_SIZE):
+        batch = thread_ids[batch_start : batch_start + _BATCH_SIZE]
+
+        # Build a single mutation with aliased resolveReviewThread calls
+        mutation_parts = []
+        variables: dict[str, str] = {}
+        for i, tid in enumerate(batch):
+            var_name = f"tid{i}"
+            variables[var_name] = tid
+            mutation_parts.append(
+                f"  t{i}: resolveReviewThread(input: {{threadId: ${var_name}}}) {{"
+                f"    thread {{ id isResolved }}"
+                f"  }}"
+            )
+
+        # Build variable declarations
+        var_decls = ", ".join(f"${k}: ID!" for k in variables)
+        mutation = f"mutation({var_decls}) {{\n" + "\n".join(mutation_parts) + "\n}"
+
+        try:
+            data = _graphql(mutation, variables, token)
+            result_data = data.get("data", {})
+            for i, tid in enumerate(batch):
+                alias = f"t{i}"
+                thread_result = result_data.get(alias, {}).get("thread", {})
+                if thread_result.get("isResolved"):
+                    resolved.append(tid)
+        except Exception as e:
+            log.warning("Batch resolve failed for %d threads: %s", len(batch), e)
+
+    return resolved
 
 
 def resolve_addressed_threads(
@@ -183,7 +214,9 @@ def resolve_addressed_threads(
     Returns count of resolved threads.
     """
     threads = fetch_review_threads(owner, repo, pr_number, token)
-    resolved_count = 0
+
+    # Collect thread IDs that need resolution
+    to_resolve: list[str] = []
     for t in threads:
         if t["isResolved"]:
             continue
@@ -192,13 +225,17 @@ def resolve_addressed_threads(
         path = t.get("path")
         line = t.get("line")
         if path and path in changed_files:
-            # If specific line changed, or file was broadly modified
             file_lines = changed_files[path]
             if line is None or line in file_lines:
-                if resolve_thread_by_node_id(t["id"], token):
-                    resolved_count += 1
-                    log.info("Resolved addressed thread at %s:%s", path, line)
-    return resolved_count
+                to_resolve.append(t["id"])
+
+    if not to_resolve:
+        return 0
+
+    resolved = resolve_threads_batch(to_resolve, token)
+    for tid in resolved:
+        log.info("Resolved addressed thread %s", tid)
+    return len(resolved)
 
 
 def resolve_dismissed_threads(
@@ -230,47 +267,53 @@ def resolve_dismissed_threads(
         if parent_id and parent_id in vigil_roots:
             replies_to.setdefault(parent_id, []).append(c)
 
-    # Check which Vigil threads have "resolved" replies
-    threads_to_resolve: set[str] = set()  # node_ids
+    # Check which Vigil root comments have "resolved" replies
+    # Track by (path, line, session_id) for robust matching to GraphQL threads
+    roots_to_resolve: list[dict] = []  # root comment dicts
     for root_id in vigil_roots:
         replies = replies_to.get(root_id, [])
         for reply in replies:
             body = reply.get("body", "").strip().lower()
             if body == "resolved" or body == "resolve":
-                root = by_id[root_id]
-                node_id = root.get("node_id")
-                if node_id:
-                    threads_to_resolve.add(node_id)
+                roots_to_resolve.append(by_id[root_id])
                 break
 
-    # Need thread IDs (not comment node IDs) for resolution
-    # Fetch threads and match by comment body/path
-    if not threads_to_resolve:
+    if not roots_to_resolve:
         return 0
 
+    # Fetch threads and match by (path, line, session_id) for robust identification
     threads = fetch_review_threads(owner, repo, pr_number, token)
-    resolved_count = 0
+
+    # Build a lookup key for each root that needs resolution
+    def _match_key(path: str | None, line: int | None, body: str) -> tuple[str | None, int | None, str]:
+        """Extract (path, line, session_id) as a matching key."""
+        match = VIGIL_SESSION_PATTERN.search(body)
+        sid = match.group(0) if match else ""
+        return (path, line, sid)
+
+    root_keys: set[tuple] = set()
+    for root in roots_to_resolve:
+        key = _match_key(root.get("path"), root.get("line") or root.get("original_line"), root.get("body", ""))
+        root_keys.add(key)
+
+    # Match threads to roots by the same key
+    to_resolve: list[str] = []
     for t in threads:
         if t["isResolved"]:
             continue
         if not VIGIL_SESSION_PATTERN.search(t.get("body", "")):
             continue
-        # Match thread to a root comment that needs resolution
-        # We match by body content since thread ID != comment node_id
-        for root_id in vigil_roots:
-            root = by_id[root_id]
-            if root.get("node_id") in threads_to_resolve:
-                # Match by path + body prefix
-                if (
-                    t.get("path") == root.get("path")
-                    and t.get("body", "")[:100] == root.get("body", "")[:100]
-                ):
-                    if resolve_thread_by_node_id(t["id"], token):
-                        resolved_count += 1
-                        log.info("Resolved dismissed thread at %s:%s", t.get("path"), t.get("line"))
-                    break
+        key = _match_key(t.get("path"), t.get("line"), t.get("body", ""))
+        if key in root_keys:
+            to_resolve.append(t["id"])
 
-    return resolved_count
+    if not to_resolve:
+        return 0
+
+    resolved = resolve_threads_batch(to_resolve, token)
+    for tid in resolved:
+        log.info("Resolved dismissed thread %s", tid)
+    return len(resolved)
 
 
 def _extract_message_content(body: str) -> str:
@@ -281,6 +324,11 @@ def _extract_message_content(body: str) -> str:
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text
+
+
+def _content_fingerprint(text: str) -> str:
+    """Generate a short hash fingerprint of normalized text for fast pre-filtering."""
+    return hashlib.md5(text.encode()).hexdigest()[:12]
 
 
 def is_duplicate_finding(
@@ -311,6 +359,10 @@ def is_duplicate_finding(
         existing_text = _extract_message_content(existing.get("body", ""))
         if not existing_text:
             continue
+        # Exact match via fingerprint (fast path)
+        if _content_fingerprint(new_text) == _content_fingerprint(existing_text):
+            return True
+        # Fuzzy match via SequenceMatcher (slow path)
         ratio = difflib.SequenceMatcher(None, new_text, existing_text).ratio()
         if ratio >= similarity_threshold:
             return True
@@ -322,8 +374,24 @@ def deduplicate_comments(
     existing_comments: list[dict],
     threshold: float = 0.85,
 ) -> list[dict]:
-    """Filter out new comments that are duplicates of existing Vigil comments."""
-    return [
-        c for c in new_comments
-        if not is_duplicate_finding(c, existing_comments, threshold)
-    ]
+    """Filter out new comments that are duplicates of existing Vigil comments.
+
+    Pre-indexes existing comments by file path to avoid O(N*M) full scans.
+    """
+    if not existing_comments:
+        return list(new_comments)
+
+    # Index existing comments by path for O(1) lookup
+    by_path: dict[str, list[dict]] = defaultdict(list)
+    for c in existing_comments:
+        path = c.get("path", "")
+        if path:
+            by_path[path].append(c)
+
+    result = []
+    for c in new_comments:
+        path = c.get("path", "")
+        candidates = by_path.get(path, [])
+        if not candidates or not is_duplicate_finding(c, candidates, threshold):
+            result.append(c)
+    return result
