@@ -8,16 +8,21 @@
 #
 # The built-in GITHUB_TOKEN is used for posting reviews.
 # Since it's a bot account, it CAN approve/request_changes (not your own PR).
+#
+# Trigger: reviews on PR open/reopen/ready. Re-review via `/vigil review` comment.
+# Does NOT auto-review on every commit push.
 
 name: Vigil PR Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
 
-# Cancel in-progress reviews when a new commit is pushed
+# Cancel in-progress reviews when a new one is triggered
 concurrency:
-  group: vigil-${{ github.event.pull_request.number }}
+  group: vigil-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 permissions:
@@ -27,12 +32,54 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
-    # Skip drafts and bot PRs
+    # PR events: skip drafts and bot PRs
+    # Comment events: must be on a PR and contain /vigil review
     if: >-
-      github.event.pull_request.draft == false &&
-      github.actor != 'dependabot[bot]'
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.draft == false &&
+        github.actor != 'dependabot[bot]'
+      ) || (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/vigil review')
+      )
     steps:
+      - name: Determine PR URL
+        id: pr
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "url=${{ github.event.issue.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=${{ github.event.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: F2iProject/vigil@v1
         with:
+          pr-url: ${{ steps.pr.outputs.url }}
           model: "gemini/gemini-2.5-flash"
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+
+  dismiss:
+    runs-on: ubuntu-latest
+    # Resolve Vigil threads when someone replies "resolved"
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      !contains(github.event.comment.body, '/vigil review') &&
+      (
+        contains(github.event.comment.body, 'resolved') ||
+        contains(github.event.comment.body, 'Resolved')
+      )
+    steps:
+      - name: Determine PR URL
+        id: pr
+        shell: bash
+        run: |
+          echo "url=${{ github.event.issue.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+
+      - uses: F2iProject/vigil@v1
+        with:
+          pr-url: ${{ steps.pr.outputs.url }}
+          command: dismiss-resolved
