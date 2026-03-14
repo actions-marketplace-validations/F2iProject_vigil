@@ -7,6 +7,7 @@ from typing import Callable
 
 from litellm import completion
 
+from .alerts import send_alerts_for_verdicts
 from .diff_parser import diff_summary, filter_hunks, parse_diff, reassemble_diff
 from .models import Finding, PersonaVerdict, ReviewResult, Severity
 from .personas import Persona, ReviewProfile
@@ -204,6 +205,7 @@ def review_diff(
     model: str = "claude-sonnet-4-6",
     lead_model: str | None = None,
     on_specialist_done: Callable[[PersonaVerdict], None] | None = None,
+    repo_key: str = "",
 ) -> ReviewResult:
     """Run the full multi-persona review pipeline.
 
@@ -252,6 +254,13 @@ def review_diff(
 
         try:
             verdict = _run_specialist(persona, pr_block, model)
+
+            # Non-blocking personas: move findings to observations, force APPROVE
+            if not persona.blocking and verdict.findings:
+                verdict.observations = verdict.findings + verdict.observations
+                verdict.findings = []
+                verdict.decision = "APPROVE"
+
             verdicts.append(verdict)
             if on_specialist_done:
                 on_specialist_done(verdict)
@@ -274,16 +283,52 @@ def review_diff(
                 )
             )
 
+    # --- Step 1.5: Filter known decisions ---
+    if repo_key:
+        try:
+            from .decision_log import filter_known_findings
+            for v in verdicts:
+                orig_findings = len(v.findings)
+                orig_obs = len(v.observations)
+                v.findings = filter_known_findings(repo_key, v.findings)
+                v.observations = filter_known_findings(repo_key, v.observations)
+                suppressed = (orig_findings - len(v.findings)) + (orig_obs - len(v.observations))
+                if suppressed:
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "Suppressed %d known finding(s) for %s", suppressed, v.persona
+                    )
+        except Exception:
+            pass  # decision log is best-effort
+
+    # --- Step 1.6: Send email alerts for alert-enabled personas ---
+    alert_personas = {p.name for p in profile.specialists if p.alert}
+    if alert_personas:
+        try:
+            sent = send_alerts_for_verdicts(
+                verdicts, alert_personas,
+                pr_url=pr_context.get("url", ""),
+                pr_title=pr_context.get("title", ""),
+            )
+            if sent:
+                import logging
+                logging.getLogger(__name__).info("Sent %d alert email(s)", sent)
+        except Exception:
+            pass  # alerting is best-effort, never blocks the review
+
     # --- Step 2: Lead review (gets file summary + specialist verdicts, not full diff) ---
     lead_pr_block = _build_pr_context_block(diff, pr_context, full_summary)
     decision, summary, lead_findings = _run_lead_review(
         profile.lead_prompt, lead_pr_block, verdicts, lead_model
     )
 
-    # --- Step 3: Aggregate observations ---
+    # --- Step 3: Aggregate observations with persona tracking ---
     all_observations: list[Finding] = []
+    observation_sources: list[tuple[str, Finding]] = []
     for v in verdicts:
-        all_observations.extend(v.observations)
+        for obs in v.observations:
+            all_observations.append(obs)
+            observation_sources.append((v.persona, obs))
 
     return ReviewResult(
         decision=decision,
@@ -294,4 +339,5 @@ def review_diff(
         specialist_verdicts=verdicts,
         lead_findings=lead_findings,
         observations=all_observations,
+        observation_sources=observation_sources,
     )

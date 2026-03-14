@@ -71,7 +71,11 @@ def _format_inline_comment(f: Finding, persona: str | None = None, session_id: s
     return f"{icon} **[{f.severity.value.upper()}]** [{f.category}]{source}{sid}\n\n{f.message}{suggestion}"
 
 
-def _build_review_body(result: ReviewResult, inline_count: int = 0) -> str:
+def _build_review_body(
+    result: ReviewResult,
+    inline_count: int = 0,
+    observation_issues: list[tuple[Finding, str]] | None = None,
+) -> str:
     """Build the review body. Findings posted inline are excluded from the body."""
     sections = []
 
@@ -110,14 +114,48 @@ def _build_review_body(result: ReviewResult, inline_count: int = 0) -> str:
     # Non-inline findings go in body
     # (the caller separates inline vs body findings before calling this)
 
-    # Observations
+    # Observations — show as issue links if available, otherwise fallback to details block
     if result.observations:
-        sections.append(f"### Observations ({len(result.observations)} non-blocking)\n")
-        sections.append("<details>\n<summary>Expand observations</summary>\n")
-        for obs in result.observations:
-            sections.append(_format_finding(obs))
+        if observation_issues:
+            # Build a lookup from finding id to issue URL
+            issue_url_map: dict[int, str] = {id(f): url for f, url in observation_issues}
+            tracked = sum(1 for f in result.observations if id(f) in issue_url_map)
+            label = f"tracked as issue{'s' if tracked != 1 else ''}" if tracked else "non-blocking"
+            sections.append(f"### Observations ({len(result.observations)} non-blocking \u2192 {label})\n")
+            for obs in result.observations:
+                sev_emoji = {
+                    Severity.critical: "\U0001f534",
+                    Severity.high: "\U0001f7e0",
+                    Severity.medium: "\U0001f7e1",
+                    Severity.low: "\U0001f535",
+                }.get(obs.severity, "")
+                loc = f"`{obs.file}"
+                if obs.line:
+                    loc += f":{obs.line}"
+                loc += "`"
+                msg = obs.message
+                if len(msg) > 80:
+                    msg = msg[:77] + "..."
+                url = issue_url_map.get(id(obs))
+                if url:
+                    # Extract issue number from URL for compact display
+                    issue_num = url.rstrip("/").split("/")[-1]
+                    sections.append(
+                        f"- {sev_emoji} [{obs.severity.value.upper()}] {loc} \u2014 {msg} \u2192 [#{issue_num}]({url})"
+                    )
+                else:
+                    sections.append(
+                        f"- {sev_emoji} [{obs.severity.value.upper()}] {loc} \u2014 {msg}"
+                    )
             sections.append("")
-        sections.append("</details>\n")
+        else:
+            # Fallback: no issue URLs, use collapsible details block
+            sections.append(f"### Observations ({len(result.observations)} non-blocking)\n")
+            sections.append("<details>\n<summary>Expand observations</summary>\n")
+            for obs in result.observations:
+                sections.append(_format_finding(obs))
+                sections.append("")
+            sections.append("</details>\n")
 
     # Footer
     total_findings = sum(len(v.findings) for v in result.specialist_verdicts) + len(result.lead_findings)
@@ -184,6 +222,7 @@ def post_review(
     token: str,
     diff: str = "",
     existing_comments: list[dict] | None = None,
+    observation_issues: list[tuple[Finding, str]] | None = None,
 ) -> str:
     """Post the review result as a GitHub PR review with inline comments.
 
@@ -227,7 +266,7 @@ def post_review(
             log.info("Deduplicated %d comments (already posted)", dupes)
 
     # Build the body
-    body = _build_review_body(result, inline_count=len(inline_comments))
+    body = _build_review_body(result, inline_count=len(inline_comments), observation_issues=observation_issues)
     if body_findings:
         body += "\n\n" + _build_body_findings_section(body_findings)
 

@@ -68,6 +68,8 @@ class Persona:
     focus: str
     system_prompt: str
     file_patterns: list[str] = field(default_factory=list)  # glob patterns for file-level routing
+    blocking: bool = True    # if False, findings become observations and don't block review
+    alert: bool = False      # if True, send email alert for findings (even if non-blocking)
 
 
 @dataclass
@@ -116,6 +118,8 @@ Do NOT evaluate: style, architecture, general bugs, tests (other reviewers handl
                     "*.env*", "*.yml", "*.yaml", "*.toml", "*.json", "*.lock",
                     "*auth*", "*secret*", "*token*", "*crypto*", "*middleware*",
                     "!*.test.*", "!*.spec.*", "!*.md", "!*.css", "!*.scss"],
+    blocking=False,
+    alert=True,
 )
 
 _ARCHITECTURE = Persona(
@@ -267,6 +271,8 @@ Do NOT evaluate: module boundaries, GxP compliance, schema design, test coverage
                     "*auth*", "*secret*", "*token*", "*crypto*", "*middleware*",
                     "*guard*", "*policy*", "*permission*", "*tenant*",
                     "!*.test.*", "!*.spec.*", "!*.md", "!*.css", "!*.scss"],
+    blocking=False,
+    alert=True,
 )
 
 _ENTERPRISE_TEST = Persona(

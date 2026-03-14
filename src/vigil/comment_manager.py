@@ -13,6 +13,16 @@ log = logging.getLogger(__name__)
 VIGIL_SIGNATURE = "Reviewed by [Vigil]"
 VIGIL_SESSION_PATTERN = re.compile(r"VGL-[0-9a-f]{6}")
 
+# Resolution reply detection
+_RESOLUTION_KEYWORDS = re.compile(
+    r"\b(resolved|fixed|addressed|done)\b", re.IGNORECASE
+)
+_ISSUE_LINK_PATTERN = re.compile(
+    r"https?://github\.com/([^/]+)/([^/]+)/issues/(\d+)"
+)
+_SHORT_ISSUE_REF = re.compile(r"#(\d+)")
+_ISSUE_RELEVANCE_THRESHOLD = 0.25
+
 # Pattern to strip formatting for dedup comparison
 _STRIP_PATTERNS = [
     re.compile(r"[\U0001f534\U0001f7e0\U0001f7e1\U0001f535]"),  # severity emoji
@@ -238,6 +248,125 @@ def resolve_addressed_threads(
     return len(resolved)
 
 
+def _is_resolution_reply(body: str) -> bool:
+    """Check if a reply body indicates resolution (keyword, issue link, or combo)."""
+    body = body.strip()
+    if not body:
+        return False
+    # Pure keyword match
+    if _RESOLUTION_KEYWORDS.search(body):
+        return True
+    # Issue link (full URL or short ref like #45)
+    if _ISSUE_LINK_PATTERN.search(body) or _SHORT_ISSUE_REF.search(body):
+        return True
+    return False
+
+
+def _extract_issue_refs(body: str) -> list[tuple[str, str, int]]:
+    """Extract (owner, repo, issue_number) tuples from issue references.
+
+    Handles both full URLs (https://github.com/org/repo/issues/123)
+    and short refs (#123). Short refs without owner/repo context return
+    empty strings for owner/repo (caller must fill in from PR context).
+    """
+    results: list[tuple[str, str, int]] = []
+
+    # Full URL matches — track their spans so we don't double-count short refs inside them
+    full_url_spans: list[tuple[int, int]] = []
+    for match in _ISSUE_LINK_PATTERN.finditer(body):
+        owner, repo, num = match.group(1), match.group(2), int(match.group(3))
+        results.append((owner, repo, num))
+        full_url_spans.append((match.start(), match.end()))
+
+    # Short refs — skip if they fall inside a full URL
+    for match in _SHORT_ISSUE_REF.finditer(body):
+        pos = match.start()
+        inside_url = any(start <= pos < end for start, end in full_url_spans)
+        if not inside_url:
+            results.append(("", "", int(match.group(1))))
+
+    return results
+
+
+def _fetch_issue(owner: str, repo: str, issue_number: int, token: str) -> dict | None:
+    """Fetch a GitHub issue by number. Returns None on failure."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+    try:
+        resp = httpx.get(url, headers=_github_headers(token), timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.warning("Failed to fetch issue %s/%s#%d: %s", owner, repo, issue_number, e)
+        return None
+
+
+def _issue_covers_finding(issue: dict, finding_body: str) -> bool:
+    """Check if an issue's content is relevant to a Vigil finding.
+
+    Uses keyword overlap: extracts meaningful words from the finding body,
+    checks what fraction appear in the issue title + body.
+    """
+    stop_words = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "must", "ought",
+        "this", "that", "these", "those", "it", "its", "not", "no", "nor",
+        "but", "and", "or", "so", "if", "then", "than", "too", "very",
+        "for", "with", "about", "against", "between", "through", "during",
+        "before", "after", "above", "below", "from", "up", "down", "in",
+        "out", "on", "off", "over", "under", "again", "further", "once",
+        "here", "there", "when", "where", "why", "how", "all", "each",
+        "every", "both", "few", "more", "most", "other", "some", "such",
+        "only", "own", "same", "also", "just", "use", "used", "using",
+        "file", "line", "code", "null", "none", "true", "false",
+    }
+
+    finding_text = _extract_message_content(finding_body)
+    issue_text = (issue.get("title", "") + " " + (issue.get("body") or "")).lower()
+
+    finding_words = [w for w in re.findall(r"[a-z]{3,}", finding_text) if w not in stop_words]
+    if not finding_words:
+        return True  # If no meaningful words, give benefit of doubt
+
+    matches = sum(1 for w in finding_words if w in issue_text)
+    return (matches / len(finding_words)) >= _ISSUE_RELEVANCE_THRESHOLD
+
+
+def _parse_finding_from_comment(body: str, path: str | None, line: int | None) -> "Finding | None":
+    """Try to reconstruct a Finding from a Vigil inline comment body.
+
+    Extracts severity, category, and message from the formatted comment text.
+    Returns a Finding object or None if parsing fails.
+    """
+    from .models import Finding, Severity
+
+    # Extract severity from tags like **[CRITICAL]**, **[HIGH]**, etc.
+    sev_match = re.search(r"\*\*\[(CRITICAL|HIGH|MEDIUM|LOW)\]\*\*", body)
+    if not sev_match:
+        return None
+    sev_str = sev_match.group(1).lower()
+    sev_map = {"critical": Severity.critical, "high": Severity.high,
+               "medium": Severity.medium, "low": Severity.low}
+    severity = sev_map.get(sev_str, Severity.medium)
+
+    # Extract category from [CategoryName] tags
+    cat_match = re.search(r"\[([\w\s]+)\]", body[sev_match.end():])
+    category = cat_match.group(1).strip() if cat_match else "unknown"
+
+    # Extract message: everything after the header line(s), before suggestion
+    message = _extract_message_content(body)
+    if not message:
+        return None
+
+    return Finding(
+        file=path or "unknown",
+        line=line,
+        severity=severity,
+        category=category,
+        message=message,
+    )
+
+
 def resolve_dismissed_threads(
     owner: str, repo: str, pr_number: int, token: str,
 ) -> int:
@@ -245,7 +374,7 @@ def resolve_dismissed_threads(
 
     Scans all PR review comments. For each Vigil inline comment thread,
     checks if any reply contains 'resolved' (case-insensitive).
-    If so, resolves the thread via GraphQL.
+    If so, resolves the thread via GraphQL and logs the decision.
 
     Returns count of resolved threads.
     """
@@ -267,19 +396,85 @@ def resolve_dismissed_threads(
         if parent_id and parent_id in vigil_roots:
             replies_to.setdefault(parent_id, []).append(c)
 
-    # Check which Vigil root comments have "resolved" replies
+    # Check which Vigil root comments have resolution replies
     # Track by (path, line, session_id) for robust matching to GraphQL threads
     roots_to_resolve: list[dict] = []  # root comment dicts
+    resolution_info: dict[int, dict] = {}  # root_id -> {reason, decided_by}
     for root_id in vigil_roots:
         replies = replies_to.get(root_id, [])
         for reply in replies:
-            body = reply.get("body", "").strip().lower()
-            if body == "resolved" or body == "resolve":
-                roots_to_resolve.append(by_id[root_id])
-                break
+            reply_body = reply.get("body", "").strip()
+            if not _is_resolution_reply(reply_body):
+                continue
+
+            # Check if reply contains issue links that need verification
+            issue_refs = _extract_issue_refs(reply_body)
+            if issue_refs:
+                # Verify at least one linked issue covers the finding
+                root_body = by_id[root_id].get("body", "")
+                verified = False
+                for ref_owner, ref_repo, ref_num in issue_refs:
+                    # Fill in owner/repo from PR context for short refs
+                    ref_owner = ref_owner or owner
+                    ref_repo = ref_repo or repo
+                    issue = _fetch_issue(ref_owner, ref_repo, ref_num, token)
+                    if issue and _issue_covers_finding(issue, root_body):
+                        verified = True
+                        break
+                if not verified:
+                    log.info(
+                        "Issue link(s) in reply to comment %d don't cover the finding — skipping",
+                        root_id,
+                    )
+                    continue
+
+            # Capture resolution metadata for decision logging
+            resolution_info[root_id] = {
+                "reason": reply_body,
+                "decided_by": reply.get("user", {}).get("login", ""),
+            }
+            roots_to_resolve.append(by_id[root_id])
+            break
 
     if not roots_to_resolve:
         return 0
+
+    # Log decisions for resolved findings
+    repo_key = f"{owner}/{repo}"
+    pr_url = f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+    for root in roots_to_resolve:
+        root_id = root["id"]
+        info = resolution_info.get(root_id, {})
+        root_body = root.get("body", "")
+        root_path = root.get("path")
+        root_line = root.get("line") or root.get("original_line")
+
+        finding = _parse_finding_from_comment(root_body, root_path, root_line)
+        if finding:
+            try:
+                from .decision_log import log_decision
+                # Infer decision type from the reply text
+                reason = info.get("reason", "")
+                reason_lower = reason.lower()
+                if "false positive" in reason_lower or "false_positive" in reason_lower:
+                    decision_type = "false_positive"
+                elif "wontfix" in reason_lower or "won't fix" in reason_lower or "acceptable" in reason_lower:
+                    decision_type = "wontfix"
+                else:
+                    decision_type = "accepted"
+
+                log_decision(
+                    repo=repo_key,
+                    finding=finding,
+                    decision=decision_type,
+                    reason=reason,
+                    decided_by=info.get("decided_by", ""),
+                    pr_url=pr_url,
+                )
+                log.info("Logged decision for %s:%s [%s] -> %s",
+                         finding.file, finding.line, finding.category, decision_type)
+            except Exception as e:
+                log.warning("Failed to log decision: %s", e)
 
     # Fetch threads and match by (path, line, session_id) for robust identification
     threads = fetch_review_threads(owner, repo, pr_number, token)
@@ -314,6 +509,39 @@ def resolve_dismissed_threads(
     for tid in resolved:
         log.info("Resolved dismissed thread %s", tid)
     return len(resolved)
+
+
+def fetch_all_vigil_comments(
+    owner: str, repo: str, pr_number: int, token: str,
+) -> list[dict]:
+    """Fetch all Vigil comments including from resolved threads.
+
+    Combines REST API comments (active) with GraphQL thread comments (resolved)
+    to provide comprehensive dedup coverage. Prevents Vigil from reposting
+    findings when threads are resolved without the underlying code changing.
+    """
+    # Active comments via REST
+    active = fetch_vigil_comments(owner, repo, pr_number, token)
+    active_bodies = {c.get("body", "") for c in active}
+
+    # Resolved thread comments via GraphQL
+    threads = fetch_review_threads(owner, repo, pr_number, token)
+    resolved_comments: list[dict] = []
+    for t in threads:
+        if not t["isResolved"]:
+            continue
+        body = t.get("body", "")
+        if not VIGIL_SESSION_PATTERN.search(body):
+            continue
+        if body in active_bodies:
+            continue  # already included from REST
+        resolved_comments.append({
+            "path": t.get("path"),
+            "line": t.get("line"),
+            "body": body,
+        })
+
+    return active + resolved_comments
 
 
 def _extract_message_content(body: str) -> str:
