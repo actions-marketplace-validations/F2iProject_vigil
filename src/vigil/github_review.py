@@ -4,7 +4,8 @@ import logging
 
 import httpx
 
-from .diff_parser import commentable_lines
+from .comment_manager import deduplicate_comments
+from .diff_parser import commentable_lines, find_best_file_for_finding, nearest_commentable_line
 from .models import Finding, PersonaVerdict, ReviewResult, Severity
 
 log = logging.getLogger(__name__)
@@ -140,6 +141,41 @@ def _build_body_findings_section(body_findings: list[tuple[str | None, Finding]]
     return "\n".join(lines)
 
 
+def _place_finding_inline(
+    f: Finding,
+    persona: str | None,
+    session_id: str,
+    valid_lines: dict[str, set[int]],
+) -> dict | None:
+    """Try to place a finding as an inline comment, relocating if needed.
+
+    Returns an inline comment dict, or None if no valid position exists.
+    """
+    # Try exact match first
+    result = nearest_commentable_line(f.file, f.line, valid_lines)
+    relocated_from = None
+
+    if result is None:
+        # File not in diff — find the best alternative file
+        result = find_best_file_for_finding(f.file, valid_lines)
+        if result is not None:
+            relocated_from = f"{f.file}:{f.line or '?'}"
+
+    elif result[1] != f.line or result[0] != f.file:
+        # Same file but different line
+        relocated_from = f"{f.file}:{f.line or '?'}"
+
+    if result is None:
+        return None
+
+    path, line = result
+    body = _format_inline_comment(f, persona, session_id)
+    if relocated_from:
+        body = f"*Originally for `{relocated_from}` (nearest diff location)*\n\n" + body
+
+    return {"path": path, "line": line, "side": "RIGHT", "body": body}
+
+
 def post_review(
     owner: str,
     repo: str,
@@ -147,11 +183,12 @@ def post_review(
     result: ReviewResult,
     token: str,
     diff: str = "",
+    existing_comments: list[dict] | None = None,
 ) -> str:
     """Post the review result as a GitHub PR review with inline comments.
 
-    Findings that land on valid diff lines are posted as inline comments.
-    Everything else goes in the review body.
+    All findings are forced inline where possible. Only falls back to the
+    review body when the diff is completely empty.
 
     Returns the URL of the created review.
     """
@@ -160,44 +197,34 @@ def post_review(
     if diff:
         valid_lines = commentable_lines(diff)
 
-    # Separate findings into inline vs body
+    # Place all findings inline where possible
     inline_comments: list[dict] = []
     body_findings: list[tuple[str | None, Finding]] = []
 
     # Specialist findings
     for v in result.specialist_verdicts:
         for f in v.findings:
-            if (
-                diff
-                and f.file in valid_lines
-                and f.line is not None
-                and f.line in valid_lines[f.file]
-            ):
-                inline_comments.append({
-                    "path": f.file,
-                    "line": f.line,
-                    "side": "RIGHT",
-                    "body": _format_inline_comment(f, v.persona, v.session_id),
-                })
+            comment = _place_finding_inline(f, v.persona, v.session_id, valid_lines)
+            if comment:
+                inline_comments.append(comment)
             else:
                 body_findings.append((v.persona, f))
 
     # Lead findings
     for f in result.lead_findings:
-        if (
-            diff
-            and f.file in valid_lines
-            and f.line is not None
-            and f.line in valid_lines[f.file]
-        ):
-            inline_comments.append({
-                "path": f.file,
-                "line": f.line,
-                "side": "RIGHT",
-                "body": _format_inline_comment(f, "Lead"),
-            })
+        comment = _place_finding_inline(f, "Lead", "", valid_lines)
+        if comment:
+            inline_comments.append(comment)
         else:
             body_findings.append((None, f))
+
+    # Deduplicate against existing Vigil comments
+    if existing_comments:
+        before_count = len(inline_comments)
+        inline_comments = deduplicate_comments(inline_comments, existing_comments)
+        dupes = before_count - len(inline_comments)
+        if dupes:
+            log.info("Deduplicated %d comments (already posted)", dupes)
 
     # Build the body
     body = _build_review_body(result, inline_count=len(inline_comments))

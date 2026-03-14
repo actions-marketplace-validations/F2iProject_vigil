@@ -1,5 +1,6 @@
 """Parse unified diffs into per-file hunks for targeted routing."""
 
+import bisect
 import fnmatch
 import re
 from dataclasses import dataclass
@@ -161,3 +162,67 @@ def commentable_lines(raw_diff: str) -> dict[str, set[int]]:
             result[hunk.path] = valid_lines
 
     return result
+
+
+def nearest_commentable_line(
+    file_path: str,
+    target_line: int | None,
+    valid_lines: dict[str, set[int]],
+) -> tuple[str, int] | None:
+    """Find the nearest commentable line for a finding in the same file.
+
+    Returns (file_path, line) or None if the file is not in the diff.
+    """
+    if file_path not in valid_lines:
+        return None
+
+    file_line_set = valid_lines[file_path]
+    if not file_line_set:
+        return None
+
+    sorted_lines = sorted(file_line_set)
+
+    if target_line is not None and target_line in file_line_set:
+        return (file_path, target_line)
+
+    if target_line is None:
+        return (file_path, sorted_lines[0])
+
+    # Find nearest via binary search
+    idx = bisect.bisect_left(sorted_lines, target_line)
+    candidates = []
+    if idx < len(sorted_lines):
+        candidates.append(sorted_lines[idx])
+    if idx > 0:
+        candidates.append(sorted_lines[idx - 1])
+    nearest = min(candidates, key=lambda l: abs(l - target_line))
+    return (file_path, nearest)
+
+
+def find_best_file_for_finding(
+    finding_file: str,
+    valid_lines: dict[str, set[int]],
+) -> tuple[str, int] | None:
+    """When a finding's file is not in the diff, find the best file to attach it to.
+
+    Strategy:
+    1. Fuzzy match by filename (e.g. file was renamed, or path differs)
+    2. Fall back to the first file alphabetically in the diff
+
+    Returns (file_path, first_commentable_line) or None if diff is empty.
+    """
+    if not valid_lines:
+        return None
+
+    # Try matching by basename
+    from pathlib import PurePosixPath
+    finding_name = PurePosixPath(finding_file).name
+    for path, lines in valid_lines.items():
+        if PurePosixPath(path).name == finding_name and lines:
+            return (path, min(lines))
+
+    # Fall back to first file in diff that has commentable lines
+    for path in sorted(valid_lines.keys()):
+        if valid_lines[path]:
+            return (path, min(valid_lines[path]))
+    return None

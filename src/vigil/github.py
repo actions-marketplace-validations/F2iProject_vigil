@@ -46,3 +46,34 @@ def get_pr_data(owner: str, repo: str, pr_number: int, token: str) -> dict:
         "additions": meta["additions"],
         "deletions": meta["deletions"],
     }
+
+
+def get_diff_between_commits(
+    owner: str, repo: str, base_sha: str, head_sha: str, token: str,
+) -> str:
+    """Fetch the diff between two commits."""
+    headers = {
+        "Accept": "application/vnd.github.v3.diff",
+        "Authorization": f"Bearer {token}",
+    }
+    url = f"https://api.github.com/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}"
+    with httpx.Client() as client:
+        resp = client.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+
+
+def get_changed_files_between_commits(
+    owner: str, repo: str, base_sha: str, head_sha: str, token: str,
+) -> list[str]:
+    """Get list of file paths changed between two commits."""
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"Bearer {token}",
+    }
+    url = f"https://api.github.com/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}"
+    with httpx.Client() as client:
+        resp = client.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return [f["filename"] for f in data.get("files", [])]

@@ -7,6 +7,14 @@ branding:
   color: "purple"
 
 inputs:
+  pr-url:
+    description: "PR URL to review (auto-detected from event context if omitted)"
+    required: false
+    default: ""
+  command:
+    description: "Command to run: review (default), dismiss-resolved"
+    required: false
+    default: "review"
   model:
     description: "LLM model for specialists (litellm format, e.g. gemini/gemini-2.5-flash)"
     required: false
@@ -45,7 +53,7 @@ runs:
       shell: bash
       run: pip install "${{ github.action_path }}"
 
-    - name: Run review
+    - name: Run Vigil
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -53,13 +61,24 @@ runs:
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: |
-        ARGS=(
-          "${{ github.event.pull_request.html_url }}"
-          --model "${{ inputs.model }}"
-          --profile "${{ inputs.profile }}"
-          --post
-        )
-        if [ -n "${{ inputs.lead-model }}" ]; then
-          ARGS+=(--lead-model "${{ inputs.lead-model }}")
+        PR_URL="${{ inputs.pr-url }}"
+        if [ -z "$PR_URL" ]; then
+          PR_URL="${{ github.event.pull_request.html_url }}"
         fi
-        vigil review "${ARGS[@]}"
+
+        COMMAND="${{ inputs.command }}"
+
+        if [ "$COMMAND" = "dismiss-resolved" ]; then
+          vigil dismiss-resolved "$PR_URL"
+        else
+          ARGS=(
+            "$PR_URL"
+            --model "${{ inputs.model }}"
+            --profile "${{ inputs.profile }}"
+            --post
+          )
+          if [ -n "${{ inputs.lead-model }}" ]; then
+            ARGS+=(--lead-model "${{ inputs.lead-model }}")
+          fi
+          vigil review "${ARGS[@]}"
+        fi

@@ -1,6 +1,5 @@
 """CLI entry point for Vigil."""
 
-import json
 import logging
 import os
 
@@ -11,7 +10,14 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .audit import write_audit_entry
-from .github import get_pr_data, parse_pr_url
+from .comment_manager import (
+    fetch_vigil_comments,
+    get_last_reviewed_sha,
+    resolve_addressed_threads,
+    resolve_dismissed_threads,
+)
+from .diff_parser import commentable_lines, parse_diff, reassemble_diff
+from .github import get_changed_files_between_commits, get_pr_data, parse_pr_url
 from .github_review import post_review, react, remove_reaction
 from .models import Finding, PersonaVerdict, ReviewResult, Severity
 from .personas import PROFILES
@@ -119,6 +125,69 @@ def review(
     )
     console.print(f"[dim]Profile: {review_profile.name} ({len(review_profile.specialists)} specialists)[/dim]\n")
 
+    # --- Pre-review pipeline: incremental review, resolve, dedup ---
+    last_sha = None
+    existing_comments: list[dict] = []
+    review_diff_text = pr_data["diff"]
+
+    if post:
+        try:
+            last_sha = get_last_reviewed_sha(owner, repo, pr_number, token)
+        except Exception as e:
+            console.print(f"[dim yellow]Could not check previous reviews: {e}[/dim yellow]")
+
+    if last_sha:
+        console.print(f"[dim]Previous review at commit {last_sha[:7]}[/dim]")
+
+        # Resolve threads with "resolved" replies
+        try:
+            dismissed = resolve_dismissed_threads(owner, repo, pr_number, token)
+            if dismissed:
+                console.print(f"[dim]Resolved {dismissed} dismissed thread(s)[/dim]")
+        except Exception as e:
+            console.print(f"[dim yellow]Could not resolve dismissed threads: {e}[/dim yellow]")
+
+        # Get incremental changes and resolve addressed threads
+        try:
+            changed_files = get_changed_files_between_commits(
+                owner, repo, last_sha, pr_data["head_sha"], token,
+            )
+            if not changed_files:
+                console.print("[dim]No files changed since last review — skipping[/dim]")
+                raise typer.Exit(0)
+
+            console.print(f"[dim]Incremental review: {len(changed_files)} file(s) changed since {last_sha[:7]}[/dim]")
+
+            # Auto-resolve threads at changed lines
+            incremental_lines = commentable_lines(pr_data["diff"])
+            # Narrow to only files that changed since last review
+            changed_set = set(changed_files)
+            changed_line_map = {f: lines for f, lines in incremental_lines.items() if f in changed_set}
+            resolved = resolve_addressed_threads(
+                owner, repo, pr_number, token, changed_line_map,
+            )
+            if resolved:
+                console.print(f"[dim]Auto-resolved {resolved} outdated thread(s)[/dim]")
+
+            # Filter diff to only changed files for specialist review
+            all_hunks = parse_diff(pr_data["diff"])
+            filtered_hunks = [h for h in all_hunks if h.path in changed_set]
+            review_diff_text = reassemble_diff(filtered_hunks)
+
+        except typer.Exit:
+            raise
+        except Exception as e:
+            console.print(f"[dim yellow]Incremental diff failed (force-push?), falling back to full review: {e}[/dim yellow]")
+            review_diff_text = pr_data["diff"]
+
+        # Fetch existing comments for deduplication
+        try:
+            existing_comments = fetch_vigil_comments(owner, repo, pr_number, token)
+            if existing_comments:
+                console.print(f"[dim]{len(existing_comments)} existing Vigil comment(s) for dedup[/dim]")
+        except Exception as e:
+            console.print(f"[dim yellow]Could not fetch existing comments: {e}[/dim yellow]")
+
     # Signal review start
     rocket_id = None
     if post:
@@ -126,11 +195,11 @@ def review(
         if rocket_id:
             console.print("[dim]Rocket sent[/dim]")
 
-    # Run review
+    # Run review on the appropriate diff (full or incremental)
     console.print("[bold]Specialist reviews:[/bold]")
     try:
         result = review_diff(
-            pr_data["diff"],
+            review_diff_text,
             pr_data,
             profile=review_profile,
             model=model,
@@ -188,7 +257,11 @@ def review(
         # Enable debug logging for github_review module
         logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
         try:
-            review_url = post_review(owner, repo, pr_number, result, token, diff=pr_data["diff"])
+            review_url = post_review(
+                owner, repo, pr_number, result, token,
+                diff=pr_data["diff"],
+                existing_comments=existing_comments or None,
+            )
             console.print(f"[green]Review posted:[/green] {review_url}")
         except Exception as e:
             console.print(f"[red]Error posting review:[/red] {e}")
@@ -200,6 +273,21 @@ def review(
             react(owner, repo, pr_number, token, "+1")
         elif result.decision in ("REQUEST_CHANGES", "BLOCK"):
             react(owner, repo, pr_number, token, "eyes")
+
+
+@app.command(name="dismiss-resolved")
+def dismiss_resolved(
+    pr_url: str = typer.Argument(help="GitHub PR URL"),
+):
+    """Resolve Vigil comment threads that received a 'resolved' reply."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        console.print("[red]Error:[/red] Set GITHUB_TOKEN environment variable.")
+        raise typer.Exit(1)
+
+    owner, repo, pr_number = parse_pr_url(pr_url)
+    count = resolve_dismissed_threads(owner, repo, pr_number, token)
+    console.print(f"[dim]Resolved {count} dismissed thread(s)[/dim]")
 
 
 @app.command()
