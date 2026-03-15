@@ -66,7 +66,7 @@ That's it. Vigil fetches the PR, runs all specialists, and posts a review with i
 vigil review <PR_URL> [OPTIONS]
 
 Options:
-  -m, --model TEXT        LLM model (default: claude-sonnet-4-6)
+  -m, --model TEXT        LLM model (default: gemini/gemini-2.5-flash)
   --lead-model TEXT       Different model for the lead reviewer
   -p, --profile TEXT      Review profile: default, enterprise
   --json                  Output raw JSON instead of pretty-printing

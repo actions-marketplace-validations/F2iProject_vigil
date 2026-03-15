@@ -202,7 +202,7 @@ def review_diff(
     diff: str,
     pr_context: dict,
     profile: ReviewProfile,
-    model: str = "claude-sonnet-4-6",
+    model: str = "gemini/gemini-2.5-flash",
     lead_model: str | None = None,
     on_specialist_done: Callable[[PersonaVerdict], None] | None = None,
     repo_key: str = "",
