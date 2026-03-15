@@ -4,7 +4,11 @@ import pytest
 
 from vigil.comment_manager import (
     _content_fingerprint,
+    _extract_issue_refs,
     _extract_message_content,
+    _is_resolution_reply,
+    _issue_covers_finding,
+    _parse_finding_from_comment,
     deduplicate_comments,
     is_duplicate_finding,
     resolve_threads_batch,
@@ -243,3 +247,157 @@ class TestResolveThreadsBatch:
         # No network call should happen
         result = resolve_threads_batch([], "fake-token")
         assert result == []
+
+
+# ---------- _is_resolution_reply ----------
+
+class TestIsResolutionReply:
+
+    def test_resolved_keyword(self):
+        assert _is_resolution_reply("resolved") is True
+
+    def test_fixed_keyword(self):
+        assert _is_resolution_reply("fixed") is True
+
+    def test_addressed_keyword(self):
+        assert _is_resolution_reply("addressed") is True
+
+    def test_done_keyword(self):
+        assert _is_resolution_reply("done") is True
+
+    def test_case_insensitive(self):
+        assert _is_resolution_reply("RESOLVED") is True
+        assert _is_resolution_reply("Fixed") is True
+
+    def test_with_surrounding_text(self):
+        assert _is_resolution_reply("This has been resolved.") is True
+
+    def test_issue_link_short(self):
+        assert _is_resolution_reply("#45") is True
+
+    def test_issue_link_full_url(self):
+        assert _is_resolution_reply("https://github.com/org/repo/issues/123") is True
+
+    def test_combined_keyword_and_link(self):
+        assert _is_resolution_reply("Fixed in #45") is True
+
+    def test_empty_string(self):
+        assert _is_resolution_reply("") is False
+
+    def test_unrelated_text(self):
+        assert _is_resolution_reply("LGTM") is False
+
+    def test_partial_keyword_rejected(self):
+        assert _is_resolution_reply("unresolvable") is False
+
+    def test_whitespace_only(self):
+        assert _is_resolution_reply("   ") is False
+
+    def test_resolved_with_issue_link(self):
+        assert _is_resolution_reply("Resolved via https://github.com/o/r/issues/10") is True
+
+    def test_just_number_not_resolution(self):
+        assert _is_resolution_reply("42") is False
+
+
+# ---------- _extract_issue_refs ----------
+
+class TestExtractIssueRefs:
+
+    def test_full_url(self):
+        refs = _extract_issue_refs("See https://github.com/org/repo/issues/123")
+        assert len(refs) == 1
+        assert refs[0] == ("org", "repo", 123)
+
+    def test_short_ref(self):
+        refs = _extract_issue_refs("Fixed in #45")
+        assert len(refs) == 1
+        assert refs[0] == ("", "", 45)
+
+    def test_multiple_refs(self):
+        refs = _extract_issue_refs("Fixed #1 and #2")
+        assert len(refs) == 2
+
+    def test_mixed_full_and_short(self):
+        refs = _extract_issue_refs("See https://github.com/org/repo/issues/1 and #2")
+        assert len(refs) == 2
+        # Full URL
+        assert ("org", "repo", 1) in refs
+        # Short ref
+        assert ("", "", 2) in refs
+
+    def test_no_refs(self):
+        refs = _extract_issue_refs("Just a comment with no links")
+        assert refs == []
+
+
+# ---------- _issue_covers_finding ----------
+
+class TestIssueCoversFinding:
+
+    def test_relevant_issue(self):
+        issue = {"title": "Fix SQL injection in login handler", "body": "The query is not parameterized"}
+        finding = "SQL injection vulnerability in the login query construction"
+        assert _issue_covers_finding(issue, finding) is True
+
+    def test_irrelevant_issue(self):
+        issue = {"title": "Update README formatting", "body": "Fix some typos in docs"}
+        finding = "SQL injection vulnerability in the login query construction"
+        assert _issue_covers_finding(issue, finding) is False
+
+    def test_empty_issue_body(self):
+        issue = {"title": "Fix security vulnerabilities", "body": None}
+        finding = "Security vulnerability in authentication"
+        assert _issue_covers_finding(issue, finding) is True
+
+    def test_partial_overlap(self):
+        issue = {"title": "Database connection pooling", "body": "Improve connection handling and reduce leaks"}
+        finding = "Database connection is never closed, causing resource leaks"
+        assert _issue_covers_finding(issue, finding) is True
+
+    def test_completely_unrelated(self):
+        issue = {"title": "Add dark mode toggle", "body": "Users want dark mode support"}
+        finding = "Buffer overflow in the parser when handling malformed input"
+        assert _issue_covers_finding(issue, finding) is False
+
+    def test_empty_finding(self):
+        issue = {"title": "Fix bug", "body": "Fix it"}
+        finding = ""
+        assert _issue_covers_finding(issue, finding) is True  # benefit of doubt
+
+
+# ---------- _parse_finding_from_comment ----------
+
+class TestParseFindingFromComment:
+
+    def test_parses_standard_comment(self):
+        body = "\U0001f534 **[CRITICAL]** [SQL Injection] **Security** `VGL-abc123`\n\nUnsafe query construction"
+        finding = _parse_finding_from_comment(body, "src/app.py", 10)
+        assert finding is not None
+        assert finding.file == "src/app.py"
+        assert finding.line == 10
+        assert finding.severity.value == "critical"
+        assert finding.category == "SQL Injection"
+
+    def test_parses_medium_severity(self):
+        body = "\U0001f7e1 **[MEDIUM]** [Race Condition] **Logic** `VGL-def456`\n\nShared counter issue"
+        finding = _parse_finding_from_comment(body, "src/db.py", 42)
+        assert finding is not None
+        assert finding.severity.value == "medium"
+        assert finding.category == "Race Condition"
+
+    def test_returns_none_for_non_vigil_comment(self):
+        body = "LGTM, looks good!"
+        finding = _parse_finding_from_comment(body, "src/app.py", 10)
+        assert finding is None
+
+    def test_handles_none_path(self):
+        body = "\U0001f7e0 **[HIGH]** [Auth] **Security**\n\nMissing auth check"
+        finding = _parse_finding_from_comment(body, None, None)
+        assert finding is not None
+        assert finding.file == "unknown"
+        assert finding.line is None
+
+    def test_handles_empty_body(self):
+        finding = _parse_finding_from_comment("", "app.py", 1)
+        assert finding is None

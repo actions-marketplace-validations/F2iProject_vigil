@@ -43,3 +43,4 @@ class ReviewResult(BaseModel):
     specialist_verdicts: list[PersonaVerdict]
     lead_findings: list[Finding]  # lead reviewer's own findings (scope, conventions, etc.)
     observations: list[Finding]  # all non-blocking observations aggregated
+    observation_sources: list[tuple[str, Finding]] = []  # (persona_name, finding) for issue creation

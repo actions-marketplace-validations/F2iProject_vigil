@@ -7,6 +7,7 @@ import httpx
 from .comment_manager import deduplicate_comments
 from .diff_parser import commentable_lines, find_best_file_for_finding, nearest_commentable_line
 from .models import Finding, PersonaVerdict, ReviewResult, Severity
+from .utils import github_headers, severity_emoji
 
 log = logging.getLogger(__name__)
 
@@ -14,10 +15,7 @@ log = logging.getLogger(__name__)
 def react(owner: str, repo: str, pr_number: int, token: str, content: str) -> int | None:
     """Add a reaction to the PR. Returns the reaction ID (for later removal) or None."""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/reactions"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = github_headers(token)
     try:
         resp = httpx.post(url, headers=headers, json={"content": content}, timeout=10)
         if resp.status_code in (200, 201):
@@ -30,10 +28,7 @@ def react(owner: str, repo: str, pr_number: int, token: str, content: str) -> in
 def remove_reaction(owner: str, repo: str, pr_number: int, token: str, reaction_id: int) -> bool:
     """Remove a reaction from the PR by its ID."""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/reactions/{reaction_id}"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = github_headers(token)
     try:
         resp = httpx.delete(url, headers=headers, timeout=10)
         return resp.status_code == 204
@@ -43,13 +38,7 @@ def remove_reaction(owner: str, repo: str, pr_number: int, token: str, reaction_
 
 def _format_finding(f: Finding, persona: str | None = None) -> str:
     """Format a single finding as markdown."""
-    sev_emoji = {
-        Severity.critical: "\U0001f534",
-        Severity.high: "\U0001f7e0",
-        Severity.medium: "\U0001f7e1",
-        Severity.low: "\U0001f535",
-    }
-    icon = sev_emoji.get(f.severity, "")
+    icon = severity_emoji(f.severity)
     source = f" ({persona})" if persona else ""
     line = f"  \n`{f.file}:{f.line}`" if f.line else f"  \n`{f.file}`"
     suggestion = f"  \n**Suggestion:** {f.suggestion}" if f.suggestion else ""
@@ -58,20 +47,18 @@ def _format_finding(f: Finding, persona: str | None = None) -> str:
 
 def _format_inline_comment(f: Finding, persona: str | None = None, session_id: str = "") -> str:
     """Format a finding for an inline diff comment (no file/line since GitHub shows that)."""
-    sev_emoji = {
-        Severity.critical: "\U0001f534",
-        Severity.high: "\U0001f7e0",
-        Severity.medium: "\U0001f7e1",
-        Severity.low: "\U0001f535",
-    }
-    icon = sev_emoji.get(f.severity, "")
+    icon = severity_emoji(f.severity)
     source = f" **{persona}**" if persona else ""
     sid = f" `{session_id}`" if session_id else ""
     suggestion = f"\n\n**Suggestion:** {f.suggestion}" if f.suggestion else ""
     return f"{icon} **[{f.severity.value.upper()}]** [{f.category}]{source}{sid}\n\n{f.message}{suggestion}"
 
 
-def _build_review_body(result: ReviewResult, inline_count: int = 0) -> str:
+def _build_review_body(
+    result: ReviewResult,
+    inline_count: int = 0,
+    observation_issues: list[tuple[Finding, str]] | None = None,
+) -> str:
     """Build the review body. Findings posted inline are excluded from the body."""
     sections = []
 
@@ -110,14 +97,43 @@ def _build_review_body(result: ReviewResult, inline_count: int = 0) -> str:
     # Non-inline findings go in body
     # (the caller separates inline vs body findings before calling this)
 
-    # Observations
+    # Observations — show as issue links if available, otherwise fallback to details block
     if result.observations:
-        sections.append(f"### Observations ({len(result.observations)} non-blocking)\n")
-        sections.append("<details>\n<summary>Expand observations</summary>\n")
-        for obs in result.observations:
-            sections.append(_format_finding(obs))
+        if observation_issues:
+            # Build a lookup from finding id to issue URL
+            issue_url_map: dict[int, str] = {id(f): url for f, url in observation_issues}
+            tracked = sum(1 for f in result.observations if id(f) in issue_url_map)
+            label = f"tracked as issue{'s' if tracked != 1 else ''}" if tracked else "non-blocking"
+            sections.append(f"### Observations ({len(result.observations)} non-blocking \u2192 {label})\n")
+            for obs in result.observations:
+                sev_icon = severity_emoji(obs.severity)
+                loc = f"`{obs.file}"
+                if obs.line:
+                    loc += f":{obs.line}"
+                loc += "`"
+                msg = obs.message
+                if len(msg) > 80:
+                    msg = msg[:77] + "..."
+                url = issue_url_map.get(id(obs))
+                if url:
+                    # Extract issue number from URL for compact display
+                    issue_num = url.rstrip("/").split("/")[-1]
+                    sections.append(
+                        f"- {sev_icon} [{obs.severity.value.upper()}] {loc} \u2014 {msg} \u2192 [#{issue_num}]({url})"
+                    )
+                else:
+                    sections.append(
+                        f"- {sev_icon} [{obs.severity.value.upper()}] {loc} \u2014 {msg}"
+                    )
             sections.append("")
-        sections.append("</details>\n")
+        else:
+            # Fallback: no issue URLs, use collapsible details block
+            sections.append(f"### Observations ({len(result.observations)} non-blocking)\n")
+            sections.append("<details>\n<summary>Expand observations</summary>\n")
+            for obs in result.observations:
+                sections.append(_format_finding(obs))
+                sections.append("")
+            sections.append("</details>\n")
 
     # Footer
     total_findings = sum(len(v.findings) for v in result.specialist_verdicts) + len(result.lead_findings)
@@ -184,11 +200,25 @@ def post_review(
     token: str,
     diff: str = "",
     existing_comments: list[dict] | None = None,
+    observation_issues: list[tuple[Finding, str]] | None = None,
 ) -> str:
     """Post the review result as a GitHub PR review with inline comments.
 
     All findings are forced inline where possible. Only falls back to the
     review body when the diff is completely empty.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        pr_number: Pull request number.
+        result: The aggregated ReviewResult with findings and observations.
+        token: GitHub API token.
+        diff: Raw diff text for computing commentable lines.
+        existing_comments: Pre-fetched Vigil comments for deduplication.
+        observation_issues: Pairs of (Finding, issue_url) for observations
+            that were opened as GitHub issues. When provided, the review body
+            renders observations as compact issue links instead of a
+            collapsible details block.
 
     Returns the URL of the created review.
     """
@@ -227,7 +257,7 @@ def post_review(
             log.info("Deduplicated %d comments (already posted)", dupes)
 
     # Build the body
-    body = _build_review_body(result, inline_count=len(inline_comments))
+    body = _build_review_body(result, inline_count=len(inline_comments), observation_issues=observation_issues)
     if body_findings:
         body += "\n\n" + _build_body_findings_section(body_findings)
 
@@ -239,10 +269,7 @@ def post_review(
     event = event_map.get(result.decision, "COMMENT")
 
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = github_headers(token)
 
     payload: dict = {
         "body": body,
