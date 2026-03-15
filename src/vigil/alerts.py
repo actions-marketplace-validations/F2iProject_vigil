@@ -18,17 +18,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from .models import Finding, PersonaVerdict, Severity
+from .utils import severity_emoji as _severity_emoji
 
 log = logging.getLogger(__name__)
-
-
-def _severity_emoji(sev: Severity) -> str:
-    return {
-        Severity.critical: "\U0001f534",
-        Severity.high: "\U0001f7e0",
-        Severity.medium: "\U0001f7e1",
-        Severity.low: "\U0001f535",
-    }.get(sev, "")
 
 
 def _format_findings_html(findings: list[Finding]) -> str:

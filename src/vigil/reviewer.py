@@ -210,9 +210,21 @@ def review_diff(
     """Run the full multi-persona review pipeline.
 
     1. Dispatch all specialists with staggered starts
-    2. Collect verdicts
-    3. Run lead reviewer with all verdicts
-    4. Return aggregated result
+    2. Collect verdicts and filter known decisions
+    3. Send email alerts for alert-enabled personas
+    4. Run lead reviewer with all verdicts
+    5. Return aggregated result
+
+    Args:
+        diff: Raw unified diff text.
+        pr_context: Dict with PR metadata (title, author, head, base, etc.).
+        profile: The ReviewProfile containing specialists and lead prompt.
+        model: LLM model identifier for specialists (default: gemini/gemini-2.5-flash).
+        lead_model: Optional separate model for the lead reviewer.
+        on_specialist_done: Optional callback invoked after each specialist finishes.
+        repo_key: Repository in "owner/repo" format. When provided, findings are
+            checked against the decision log and previously-acknowledged patterns
+            are suppressed before the lead review.
     """
     lead_model = lead_model or model
 

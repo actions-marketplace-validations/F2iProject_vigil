@@ -1,12 +1,18 @@
 """Manage Vigil review comment lifecycle: fetch, resolve, deduplicate."""
 
 import difflib
-import hashlib
 import logging
 import re
 from collections import defaultdict
 
 import httpx
+
+from .utils import (
+    content_fingerprint,
+    extract_message_content,
+    github_headers,
+    STRIP_PATTERNS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -23,26 +29,16 @@ _ISSUE_LINK_PATTERN = re.compile(
 _SHORT_ISSUE_REF = re.compile(r"#(\d+)")
 _ISSUE_RELEVANCE_THRESHOLD = 0.25
 
-# Pattern to strip formatting for dedup comparison
-_STRIP_PATTERNS = [
-    re.compile(r"[\U0001f534\U0001f7e0\U0001f7e1\U0001f535]"),  # severity emoji
-    re.compile(r"\*\*\[(?:CRITICAL|HIGH|MEDIUM|LOW)\]\*\*"),  # severity tags
-    re.compile(r"\[[\w\s]+\]"),  # category tags
-    re.compile(r"\*\*[\w\s]+\*\*"),  # bold persona names
-    re.compile(r"`VGL-[0-9a-f]{6}`"),  # session IDs
-    re.compile(r"\*\*Suggestion:\*\*.*", re.DOTALL),  # suggestion blocks
-    re.compile(r"\*Originally for.*?\*\n*"),  # relocation notes
-]
+# Backward-compatible aliases (used internally and by some imports)
+_STRIP_PATTERNS = STRIP_PATTERNS
 
 # Max thread IDs per batch mutation (GitHub GraphQL has a ~500KB payload limit)
 _BATCH_SIZE = 50
 
 
 def _github_headers(token: str) -> dict[str, str]:
-    return {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    """Build standard GitHub API headers. Delegates to utils.github_headers."""
+    return github_headers(token)
 
 
 def _paginate(url: str, headers: dict[str, str], params: dict | None = None) -> list[dict]:
@@ -545,18 +541,21 @@ def fetch_all_vigil_comments(
 
 
 def _extract_message_content(body: str) -> str:
-    """Strip formatting to get core message text for dedup comparison."""
-    text = body
-    for pattern in _STRIP_PATTERNS:
-        text = pattern.sub("", text)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip().lower()
-    return text
+    """Strip formatting to get core message text for dedup comparison.
+
+    Delegates to utils.extract_message_content. This alias is kept for
+    backward compatibility with existing imports.
+    """
+    return extract_message_content(body)
 
 
 def _content_fingerprint(text: str) -> str:
-    """Generate a short hash fingerprint of normalized text for fast pre-filtering."""
-    return hashlib.md5(text.encode()).hexdigest()[:12]
+    """Generate a short hash fingerprint of normalized text for fast pre-filtering.
+
+    Delegates to utils.content_fingerprint. This alias is kept for
+    backward compatibility with existing imports.
+    """
+    return content_fingerprint(text)
 
 
 def is_duplicate_finding(

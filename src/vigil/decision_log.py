@@ -12,8 +12,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .comment_manager import _content_fingerprint, _extract_message_content
 from .models import Finding
+from .utils import content_fingerprint, extract_message_content
 
 _DEFAULT_DB_DIR = Path.home() / ".vigil"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "decisions.db"
@@ -52,8 +52,8 @@ def _get_db(db_path: Path | None = None) -> sqlite3.Connection:
 
 def _finding_fingerprint(finding: Finding) -> str:
     """Generate a fingerprint for a finding's message content."""
-    text = _extract_message_content(finding.message)
-    return _content_fingerprint(text)
+    text = extract_message_content(finding.message)
+    return content_fingerprint(text)
 
 
 def log_decision(
@@ -133,9 +133,9 @@ def is_known_decision(
                 return dict(row)
 
         # Fuzzy match (slow path)
-        finding_text = _extract_message_content(finding.message)
+        finding_text = extract_message_content(finding.message)
         for row in rows:
-            existing_text = _extract_message_content(row["message_preview"])
+            existing_text = extract_message_content(row["message_preview"])
             if not existing_text:
                 continue
             ratio = difflib.SequenceMatcher(None, finding_text, existing_text).ratio()

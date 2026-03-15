@@ -1,4 +1,4 @@
-"""Tests for issue_manager: issue creation, dedup, label management."""
+"""Tests for issue_manager: issue creation, dedup, label management, pagination."""
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -6,6 +6,8 @@ from unittest.mock import patch, MagicMock
 from vigil.issue_manager import (
     _build_issue_body,
     _build_issue_title,
+    _fetch_all_vigil_issues,
+    _match_finding_to_issue,
     _VIGIL_ISSUE_MARKER,
     _VIGIL_LABEL,
     create_issue,
@@ -53,6 +55,18 @@ def _make_result(observations=None, verdicts=None, observation_sources=None):
         observations=obs,
         observation_sources=sources,
     )
+
+
+def _make_vigil_issue(file="src/app.py", line=10, message="Shared counter accessed without a lock"):
+    """Build a mock Vigil issue dict."""
+    loc = f"`{file}"
+    if line:
+        loc += f":{line}"
+    loc += "`"
+    return {
+        "html_url": "https://github.com/o/r/issues/5",
+        "body": f"{_VIGIL_ISSUE_MARKER}\n**File:** {loc}\n### Finding\n\n{message}\n---",
+    }
 
 
 # ---------- _build_issue_title ----------
@@ -154,73 +168,120 @@ class TestEnsureVigilLabel:
         assert ensure_vigil_label("owner", "repo", "token") is False
 
 
+# ---------- _match_finding_to_issue ----------
+
+class TestMatchFindingToIssue:
+
+    def test_matches_identical_message(self):
+        f = _make_finding(message="Shared counter accessed without a lock")
+        issues = [_make_vigil_issue(message="Shared counter accessed without a lock")]
+        assert _match_finding_to_issue(f, issues) == "https://github.com/o/r/issues/5"
+
+    def test_no_match_different_file(self):
+        f = _make_finding(file="other.py", message="Shared counter accessed without a lock")
+        issues = [_make_vigil_issue(file="src/app.py")]
+        assert _match_finding_to_issue(f, issues) is None
+
+    def test_no_match_different_message(self):
+        f = _make_finding(message="Completely different issue")
+        issues = [_make_vigil_issue(message="Shared counter accessed without a lock")]
+        assert _match_finding_to_issue(f, issues) is None
+
+    def test_no_match_without_marker(self):
+        f = _make_finding()
+        issues = [{"html_url": "url", "body": "Regular issue without marker"}]
+        assert _match_finding_to_issue(f, issues) is None
+
+    def test_empty_issues_list(self):
+        f = _make_finding()
+        assert _match_finding_to_issue(f, []) is None
+
+    def test_similar_message_matches(self):
+        f = _make_finding(message="Shared counter is accessed without proper locking mechanism")
+        issues = [_make_vigil_issue(message="Shared counter is accessed without a proper lock mechanism")]
+        result = _match_finding_to_issue(f, issues)
+        assert result == "https://github.com/o/r/issues/5"
+
+
 # ---------- find_existing_issue ----------
 
 class TestFindExistingIssue:
 
-    @patch("vigil.issue_manager.httpx.get")
-    def test_finds_matching_issue(self, mock_get):
+    def test_with_prefetched_issues(self):
         f = _make_finding(message="Shared counter accessed without a lock")
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [{
-                "html_url": "https://github.com/o/r/issues/5",
-                "body": f"{_VIGIL_ISSUE_MARKER}\n**File:** `src/app.py:10`\n### Finding\n\nShared counter accessed without a lock\n---",
-            }],
-        )
-        mock_get.return_value.raise_for_status = MagicMock()
-
-        url = find_existing_issue("o", "r", "token", f, "Logic")
+        issues = [_make_vigil_issue(message="Shared counter accessed without a lock")]
+        url = find_existing_issue("o", "r", "token", f, "Logic", existing_issues=issues)
         assert url == "https://github.com/o/r/issues/5"
 
-    @patch("vigil.issue_manager.httpx.get")
-    def test_no_matching_issues(self, mock_get):
-        f = _make_finding(message="Completely unique finding")
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [{
-                "html_url": "https://github.com/o/r/issues/5",
-                "body": f"{_VIGIL_ISSUE_MARKER}\n**File:** `other.py:10`\n### Finding\n\nDifferent issue entirely\n---",
-            }],
-        )
-        mock_get.return_value.raise_for_status = MagicMock()
-
-        url = find_existing_issue("o", "r", "token", f, "Logic")
+    def test_no_match_with_prefetched(self):
+        f = _make_finding(message="Unique issue")
+        issues = [_make_vigil_issue(message="Different issue entirely")]
+        url = find_existing_issue("o", "r", "token", f, "Logic", existing_issues=issues)
         assert url is None
 
-    @patch("vigil.issue_manager.httpx.get")
-    def test_no_vigil_issues(self, mock_get):
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
+    def test_fetches_when_no_prefetched(self, mock_fetch):
         f = _make_finding()
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [{
-                "html_url": "https://github.com/o/r/issues/1",
-                "body": "Regular issue without Vigil marker",
-            }],
-        )
-        mock_get.return_value.raise_for_status = MagicMock()
-
+        mock_fetch.return_value = []
         url = find_existing_issue("o", "r", "token", f, "Logic")
         assert url is None
+        mock_fetch.assert_called_once_with("o", "r", "token")
 
-    @patch("vigil.issue_manager.httpx.get")
-    def test_empty_issue_list(self, mock_get):
-        f = _make_finding()
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: [],
-        )
-        mock_get.return_value.raise_for_status = MagicMock()
 
-        url = find_existing_issue("o", "r", "token", f, "Logic")
-        assert url is None
+# ---------- _fetch_all_vigil_issues (pagination) ----------
 
-    @patch("vigil.issue_manager.httpx.get")
-    def test_api_error_returns_none(self, mock_get):
-        f = _make_finding()
-        mock_get.side_effect = Exception("Network error")
-        url = find_existing_issue("o", "r", "token", f, "Logic")
-        assert url is None
+class TestFetchAllVigilIssues:
+
+    @patch("vigil.issue_manager.httpx.Client")
+    def test_single_page(self, mock_client_cls):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [{"id": 1}, {"id": 2}]
+        mock_resp.headers = {}
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_resp
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        issues = _fetch_all_vigil_issues("o", "r", "token")
+        assert len(issues) == 2
+
+    @patch("vigil.issue_manager.httpx.Client")
+    def test_pagination_follows_links(self, mock_client_cls):
+        # First page: returns Link header with next
+        resp1 = MagicMock()
+        resp1.json.return_value = [{"id": 1}]
+        resp1.headers = {"Link": '<https://api.github.com/repos/o/r/issues?page=2>; rel="next"'}
+        resp1.raise_for_status = MagicMock()
+
+        # Second page: no Link header
+        resp2 = MagicMock()
+        resp2.json.return_value = [{"id": 2}]
+        resp2.headers = {}
+        resp2.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.get.side_effect = [resp1, resp2]
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        issues = _fetch_all_vigil_issues("o", "r", "token")
+        assert len(issues) == 2
+        assert mock_client.get.call_count == 2
+
+    @patch("vigil.issue_manager.httpx.Client")
+    def test_api_error_returns_empty(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.get.side_effect = Exception("Network error")
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        issues = _fetch_all_vigil_issues("o", "r", "token")
+        assert issues == []
 
 
 # ---------- create_issue ----------
@@ -264,11 +325,11 @@ class TestCreateIssuesForObservations:
         assert issues == []
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager.find_existing_issue")
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
     @patch("vigil.issue_manager.ensure_vigil_label")
-    def test_creates_new_issues(self, mock_label, mock_find, mock_create):
+    def test_creates_new_issues(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
-        mock_find.return_value = None
+        mock_fetch.return_value = []  # No existing issues
         mock_create.return_value = "https://github.com/o/r/issues/1"
 
         obs = _make_finding()
@@ -280,13 +341,15 @@ class TestCreateIssuesForObservations:
         mock_create.assert_called_once()
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager.find_existing_issue")
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
     @patch("vigil.issue_manager.ensure_vigil_label")
-    def test_deduplicates_against_existing(self, mock_label, mock_find, mock_create):
+    def test_deduplicates_against_existing(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
-        mock_find.return_value = "https://github.com/o/r/issues/5"
+        mock_fetch.return_value = [
+            _make_vigil_issue(message="Shared counter accessed without a lock")
+        ]
 
-        obs = _make_finding()
+        obs = _make_finding(message="Shared counter accessed without a lock")
         result = _make_result(observations=[obs])
         issues = create_issues_for_observations("o", "r", "token", result)
 
@@ -295,11 +358,11 @@ class TestCreateIssuesForObservations:
         mock_create.assert_not_called()  # Should NOT create a new issue
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager.find_existing_issue")
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
     @patch("vigil.issue_manager.ensure_vigil_label")
-    def test_uses_observation_sources_for_persona(self, mock_label, mock_find, mock_create):
+    def test_uses_observation_sources_for_persona(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
-        mock_find.return_value = None
+        mock_fetch.return_value = []
         mock_create.return_value = "https://github.com/o/r/issues/1"
 
         obs = _make_finding()
@@ -314,11 +377,11 @@ class TestCreateIssuesForObservations:
         assert call_args[1].get("persona") or call_args[0][4] == "Performance"
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager.find_existing_issue")
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
     @patch("vigil.issue_manager.ensure_vigil_label")
-    def test_handles_create_failure_gracefully(self, mock_label, mock_find, mock_create):
+    def test_handles_create_failure_gracefully(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
-        mock_find.return_value = None
+        mock_fetch.return_value = []
         mock_create.return_value = None  # Creation failed
 
         obs = _make_finding()
@@ -328,11 +391,11 @@ class TestCreateIssuesForObservations:
         assert len(issues) == 0  # Failed creation means no issue returned
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager.find_existing_issue")
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
     @patch("vigil.issue_manager.ensure_vigil_label")
-    def test_multiple_observations(self, mock_label, mock_find, mock_create):
+    def test_multiple_observations(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
-        mock_find.return_value = None
+        mock_fetch.return_value = []
 
         obs1 = _make_finding(file="a.py", message="Issue A")
         obs2 = _make_finding(file="b.py", message="Issue B")
@@ -352,3 +415,26 @@ class TestCreateIssuesForObservations:
 
         assert len(issues) == 2
         assert mock_create.call_count == 2
+
+    @patch("vigil.issue_manager.create_issue")
+    @patch("vigil.issue_manager._fetch_all_vigil_issues")
+    @patch("vigil.issue_manager.ensure_vigil_label")
+    def test_prefetches_issues_once(self, mock_label, mock_fetch, mock_create):
+        """Verify issues are fetched once (not per observation) to avoid N+1."""
+        mock_label.return_value = True
+        mock_fetch.return_value = []
+        mock_create.return_value = "https://github.com/o/r/issues/1"
+
+        obs1 = _make_finding(file="a.py", message="Issue A")
+        obs2 = _make_finding(file="b.py", message="Issue B")
+        obs3 = _make_finding(file="c.py", message="Issue C")
+
+        verdict = PersonaVerdict(
+            persona="Logic", decision="APPROVE",
+            checks={}, findings=[], observations=[obs1, obs2, obs3],
+        )
+        result = _make_result(observations=[obs1, obs2, obs3], verdicts=[verdict])
+        create_issues_for_observations("o", "r", "token", result)
+
+        # Issues should be fetched exactly ONCE regardless of observation count
+        mock_fetch.assert_called_once()

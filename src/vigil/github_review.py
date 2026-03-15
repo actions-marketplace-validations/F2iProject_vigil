@@ -7,6 +7,7 @@ import httpx
 from .comment_manager import deduplicate_comments
 from .diff_parser import commentable_lines, find_best_file_for_finding, nearest_commentable_line
 from .models import Finding, PersonaVerdict, ReviewResult, Severity
+from .utils import github_headers, severity_emoji
 
 log = logging.getLogger(__name__)
 
@@ -14,10 +15,7 @@ log = logging.getLogger(__name__)
 def react(owner: str, repo: str, pr_number: int, token: str, content: str) -> int | None:
     """Add a reaction to the PR. Returns the reaction ID (for later removal) or None."""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/reactions"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = github_headers(token)
     try:
         resp = httpx.post(url, headers=headers, json={"content": content}, timeout=10)
         if resp.status_code in (200, 201):
@@ -30,10 +28,7 @@ def react(owner: str, repo: str, pr_number: int, token: str, content: str) -> in
 def remove_reaction(owner: str, repo: str, pr_number: int, token: str, reaction_id: int) -> bool:
     """Remove a reaction from the PR by its ID."""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/reactions/{reaction_id}"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = github_headers(token)
     try:
         resp = httpx.delete(url, headers=headers, timeout=10)
         return resp.status_code == 204
@@ -43,13 +38,7 @@ def remove_reaction(owner: str, repo: str, pr_number: int, token: str, reaction_
 
 def _format_finding(f: Finding, persona: str | None = None) -> str:
     """Format a single finding as markdown."""
-    sev_emoji = {
-        Severity.critical: "\U0001f534",
-        Severity.high: "\U0001f7e0",
-        Severity.medium: "\U0001f7e1",
-        Severity.low: "\U0001f535",
-    }
-    icon = sev_emoji.get(f.severity, "")
+    icon = severity_emoji(f.severity)
     source = f" ({persona})" if persona else ""
     line = f"  \n`{f.file}:{f.line}`" if f.line else f"  \n`{f.file}`"
     suggestion = f"  \n**Suggestion:** {f.suggestion}" if f.suggestion else ""
@@ -58,13 +47,7 @@ def _format_finding(f: Finding, persona: str | None = None) -> str:
 
 def _format_inline_comment(f: Finding, persona: str | None = None, session_id: str = "") -> str:
     """Format a finding for an inline diff comment (no file/line since GitHub shows that)."""
-    sev_emoji = {
-        Severity.critical: "\U0001f534",
-        Severity.high: "\U0001f7e0",
-        Severity.medium: "\U0001f7e1",
-        Severity.low: "\U0001f535",
-    }
-    icon = sev_emoji.get(f.severity, "")
+    icon = severity_emoji(f.severity)
     source = f" **{persona}**" if persona else ""
     sid = f" `{session_id}`" if session_id else ""
     suggestion = f"\n\n**Suggestion:** {f.suggestion}" if f.suggestion else ""
@@ -123,12 +106,7 @@ def _build_review_body(
             label = f"tracked as issue{'s' if tracked != 1 else ''}" if tracked else "non-blocking"
             sections.append(f"### Observations ({len(result.observations)} non-blocking \u2192 {label})\n")
             for obs in result.observations:
-                sev_emoji = {
-                    Severity.critical: "\U0001f534",
-                    Severity.high: "\U0001f7e0",
-                    Severity.medium: "\U0001f7e1",
-                    Severity.low: "\U0001f535",
-                }.get(obs.severity, "")
+                sev_icon = severity_emoji(obs.severity)
                 loc = f"`{obs.file}"
                 if obs.line:
                     loc += f":{obs.line}"
@@ -141,11 +119,11 @@ def _build_review_body(
                     # Extract issue number from URL for compact display
                     issue_num = url.rstrip("/").split("/")[-1]
                     sections.append(
-                        f"- {sev_emoji} [{obs.severity.value.upper()}] {loc} \u2014 {msg} \u2192 [#{issue_num}]({url})"
+                        f"- {sev_icon} [{obs.severity.value.upper()}] {loc} \u2014 {msg} \u2192 [#{issue_num}]({url})"
                     )
                 else:
                     sections.append(
-                        f"- {sev_emoji} [{obs.severity.value.upper()}] {loc} \u2014 {msg}"
+                        f"- {sev_icon} [{obs.severity.value.upper()}] {loc} \u2014 {msg}"
                     )
             sections.append("")
         else:
@@ -229,6 +207,19 @@ def post_review(
     All findings are forced inline where possible. Only falls back to the
     review body when the diff is completely empty.
 
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        pr_number: Pull request number.
+        result: The aggregated ReviewResult with findings and observations.
+        token: GitHub API token.
+        diff: Raw diff text for computing commentable lines.
+        existing_comments: Pre-fetched Vigil comments for deduplication.
+        observation_issues: Pairs of (Finding, issue_url) for observations
+            that were opened as GitHub issues. When provided, the review body
+            renders observations as compact issue links instead of a
+            collapsible details block.
+
     Returns the URL of the created review.
     """
     # Build the map of commentable lines from the diff
@@ -278,10 +269,7 @@ def post_review(
     event = event_map.get(result.decision, "COMMENT")
 
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = github_headers(token)
 
     payload: dict = {
         "body": body,

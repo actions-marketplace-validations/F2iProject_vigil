@@ -64,12 +64,29 @@ DOMAIN SOVEREIGNTY:
 
 @dataclass
 class Persona:
+    """A specialist reviewer persona with domain-scoped expertise.
+
+    Attributes:
+        name: Display name (e.g. "Security", "Logic").
+        focus: Short description of the persona's domain.
+        system_prompt: Full system prompt sent to the LLM.
+        file_patterns: Glob patterns for file-level routing. Only files matching
+            these patterns are included in the specialist's diff. Patterns
+            prefixed with ``!`` are exclusions.
+        blocking: Whether this persona's findings block the review. When False,
+            findings are converted to non-blocking observations and the persona
+            always returns APPROVE. Default True.
+        alert: Whether to send an email alert when this persona produces findings.
+            Useful for non-blocking personas (e.g. Security) so findings are
+            still visible via email even though they don't block. Default False.
+    """
+
     name: str
     focus: str
     system_prompt: str
-    file_patterns: list[str] = field(default_factory=list)  # glob patterns for file-level routing
-    blocking: bool = True    # if False, findings become observations and don't block review
-    alert: bool = False      # if True, send email alert for findings (even if non-blocking)
+    file_patterns: list[str] = field(default_factory=list)
+    blocking: bool = True
+    alert: bool = False
 
 
 @dataclass
