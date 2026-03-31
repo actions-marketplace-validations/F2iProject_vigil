@@ -4,6 +4,7 @@ import pytest
 
 from vigil.cross_specialist_dedup import (
     MergedFinding,
+    VerdictInfo,
     merge_specialist_findings,
     format_merged_finding_comment,
     _severity_rank,
@@ -232,3 +233,243 @@ class TestMergedFindingNamedTuple:
         assert mf.count == 2
         assert len(mf.specialists) == 2
         assert len(mf.original_findings) == 2
+
+
+class TestConsensusFormatting:
+    """Test consensus table formatting for merged findings."""
+
+    def test_consensus_format_two_specialists(self):
+        """Consensus format should show table for two specialists."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-abc123"),
+            VerdictInfo(specialist="Logic", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-def456"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Logic"],
+            verdict_info=verdict_info,
+            total_specialists=6
+        )
+        assert "📊 **Consensus (2/6 specialists)**" in result
+        assert "| Specialist | Verdict | Ref |" in result
+        assert "| Security `VGL-abc123` | 🚫 REQUEST_CHANGES | SQL Injection |" in result
+        assert "| Logic `VGL-def456` | 🚫 REQUEST_CHANGES | SQL Injection |" in result
+        assert "---" in result
+
+    def test_consensus_format_three_specialists(self):
+        """Consensus format should work with three specialists."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-111"),
+            VerdictInfo(specialist="Testing", verdict="REQUEST_CHANGES",
+                       category="Input Validation", session_id="VGL-222"),
+            VerdictInfo(specialist="Performance", verdict="APPROVE",
+                       category="Performance", session_id="VGL-333"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Testing", "Performance"],
+            verdict_info=verdict_info,
+            total_specialists=5
+        )
+        assert "📊 **Consensus (3/5 specialists)**" in result
+        assert "Security" in result
+        assert "Testing" in result
+        assert "Performance" in result
+        assert "✅ APPROVE" in result
+
+    def test_consensus_shows_correct_total_count(self):
+        """Consensus should show correct N/TOTAL count."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-abc"),
+            VerdictInfo(specialist="Logic", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-def"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Logic"],
+            verdict_info=verdict_info,
+            total_specialists=8
+        )
+        assert "2/8 specialists" in result
+
+    def test_consensus_includes_verdicts(self):
+        """Consensus table should show verdicts with emojis."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Reviewer1", verdict="APPROVE",
+                       category="SQL Injection", session_id="VGL-111"),
+            VerdictInfo(specialist="Reviewer2", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-222"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Reviewer1", "Reviewer2"],
+            verdict_info=verdict_info,
+            total_specialists=3
+        )
+        assert "✅ APPROVE" in result
+        assert "🚫 REQUEST_CHANGES" in result
+
+    def test_consensus_includes_category_refs(self):
+        """Consensus table Ref column should show each specialist's category."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="Resource Lifecycle Management", session_id="VGL-ddd629"),
+            VerdictInfo(specialist="Testing", verdict="REQUEST_CHANGES",
+                       category="Data Integrity / Compliance", session_id="VGL-7dbc2f"),
+            VerdictInfo(specialist="Performance", verdict="REQUEST_CHANGES",
+                       category="Memory Leak / Unbounded Data Structure", session_id="VGL-62c24e"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Testing", "Performance"],
+            verdict_info=verdict_info,
+            total_specialists=6
+        )
+        assert "Resource Lifecycle Management" in result
+        assert "Data Integrity / Compliance" in result
+        assert "Memory Leak / Unbounded Data Structure" in result
+
+    def test_single_specialist_no_consensus_table(self):
+        """Single specialist should use simple format without consensus table."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        result = format_merged_finding_comment(
+            f, ["Security"],
+            session_ids={"Security": "VGL-abc123"}
+        )
+        assert "Consensus" not in result
+        assert "Flagged by:" in result
+        assert "Security" in result
+
+    def test_no_total_specialists_uses_simple_format(self):
+        """Without total_specialists, should use simple format."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-abc"),
+            VerdictInfo(specialist="Logic", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-def"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Logic"],
+            verdict_info=verdict_info,
+            total_specialists=None  # No total provided
+        )
+        assert "Consensus" not in result
+        assert "Flagged by:" in result
+
+    def test_consensus_includes_main_finding_content(self):
+        """Consensus format should include the main finding message and suggestion."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL concatenation",
+                   suggestion="Use parameterized queries")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-abc"),
+            VerdictInfo(specialist="Logic", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-def"),
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Logic"],
+            verdict_info=verdict_info,
+            total_specialists=3
+        )
+        assert "Dangerous SQL concatenation" in result
+        assert "Use parameterized queries" in result
+
+    def test_verdict_info_with_empty_session_id(self):
+        """VerdictInfo with empty session_id should not show backticks."""
+        f = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                   category="SQL Injection", message="Dangerous SQL")
+        verdict_info = [
+            VerdictInfo(specialist="Security", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id="VGL-abc"),
+            VerdictInfo(specialist="Logic", verdict="REQUEST_CHANGES",
+                       category="SQL Injection", session_id=""),  # No session ID
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security", "Logic"],
+            verdict_info=verdict_info,
+            total_specialists=3
+        )
+        # Security row should have session ID in backticks
+        assert "Security `VGL-abc`" in result
+        # Logic row should not have backticks
+        assert "| Logic |" in result
+
+
+class TestMergeWithVerdictInfo:
+    """Test merge_specialist_findings populates verdict_info correctly."""
+
+    def test_merged_finding_includes_verdict_info(self):
+        """Merged finding should populate verdict_info from PersonaVerdict."""
+        f1 = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                    category="SQL Injection", message="Dangerous SQL")
+        f2 = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                    category="SQL Injection", message="Dangerous SQL")
+        v1 = PersonaVerdict(
+            persona="Security",
+            session_id="VGL-111111",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f1],
+            observations=[],
+        )
+        v2 = PersonaVerdict(
+            persona="Logic",
+            session_id="VGL-222222",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f2],
+            observations=[],
+        )
+        deduped, merged = merge_specialist_findings([v1, v2])
+        assert len(merged) == 1
+        assert len(merged[0].verdict_info) == 2
+
+        # Check verdict info contains expected data
+        verdicts_by_spec = {v.specialist: v for v in merged[0].verdict_info}
+        assert "Security" in verdicts_by_spec
+        assert "Logic" in verdicts_by_spec
+        assert verdicts_by_spec["Security"].verdict == "REQUEST_CHANGES"
+        assert verdicts_by_spec["Security"].session_id == "VGL-111111"
+        assert verdicts_by_spec["Logic"].session_id == "VGL-222222"
+
+    def test_verdict_info_includes_category_from_finding(self):
+        """Verdict info should capture the category from each specialist's finding."""
+        f1 = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                    category="Resource Lifecycle Management", message="Issue")
+        f2 = Finding(file="src/auth.py", line=42, severity=Severity.high,
+                    category="Memory Management", message="Issue")
+        v1 = PersonaVerdict(
+            persona="Architecture",
+            session_id="VGL-arch001",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f1],
+            observations=[],
+        )
+        v2 = PersonaVerdict(
+            persona="Performance",
+            session_id="VGL-perf001",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f2],
+            observations=[],
+        )
+        deduped, merged = merge_specialist_findings([v1, v2])
+        assert len(merged) == 1
+
+        verdicts_by_spec = {v.specialist: v for v in merged[0].verdict_info}
+        assert verdicts_by_spec["Architecture"].category == "Resource Lifecycle Management"
+        assert verdicts_by_spec["Performance"].category == "Memory Management"
