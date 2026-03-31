@@ -166,10 +166,11 @@ def _run_lead_review(
                 f"  - [{f.severity.value}] {f.file}:{f.line or '?'} -- {f.message}"
                 for f in v.findings
             )
+        findings_header = "Findings:\n" + findings_str if findings_str else "No findings."
         verdicts_text += f"""
 ### {v.persona} [{v.session_id}]: {v.decision}
 Checks: {checks_str}
-{"Findings:\n" + findings_str if findings_str else "No findings."}
+{findings_header}
 """
 
     user_message = f"""{pr_block}
