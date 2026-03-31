@@ -70,3 +70,125 @@ def content_fingerprint(text: str) -> str:
     Returns the first 12 hex characters of the MD5 hash.
     """
     return hashlib.md5(text.encode()).hexdigest()[:12]
+
+
+# ---------- XSS Prevention & Markdown Sanitization ----------
+
+def sanitize_markdown(text: str) -> str:
+    """Sanitize markdown to prevent XSS and markdown injection attacks.
+
+    Removes or escapes dangerous content while preserving legitimate markdown:
+    - Strips HTML tags (especially <script>, <img onerror>, etc.)
+    - Escapes markdown special chars that could break formatting when embedded
+    - Preserves legitimate markdown like code blocks, bold, italic
+    - Efficient, uses only stdlib re module
+
+    Args:
+        text: The markdown text to sanitize
+
+    Returns:
+        Sanitized text safe to embed in markdown comments
+    """
+    if not text:
+        return ""
+
+    # Strip HTML tags entirely (prevents <script>, <img onerror>, etc.)
+    # Match opening/closing tags and self-closing tags
+    text = re.sub(r"<[^>]+>", "", text)
+
+    # Escape dangerous markdown patterns that could break out of formatting:
+    # - Backticks at start/end (could break code fence)
+    # - Multiple asterisks/underscores (could break bold/italic)
+    # - Square brackets followed by parens (could create links)
+    text = re.sub(r"^`+", r"\\g<0>", text, flags=re.MULTILINE)  # Escape leading backticks
+    text = re.sub(r"`+$", r"\\g<0>", text, flags=re.MULTILINE)  # Escape trailing backticks
+
+    # Escape markdown link syntax: [text](url) -> prevent link injection
+    # Replace [ with \[ when followed by text and )
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\\[\1\\](\2)", text)
+
+    # Normalize line breaks to prevent confusion
+    text = re.sub(r"\r\n", "\n", text)
+    text = re.sub(r"\r", "\n", text)
+
+    return text
+
+
+def validate_specialist_name(name: str, max_length: int = 50) -> str:
+    """Validate and sanitize a specialist name for safe embedding in comments.
+
+    Allows alphanumeric characters, spaces, hyphens, underscores.
+    Truncates to max_length to prevent excessive comment size.
+
+    Args:
+        name: The specialist name to validate
+        max_length: Maximum allowed length (default 50)
+
+    Returns:
+        Validated, sanitized name
+    """
+    if not name:
+        return "Unknown"
+
+    # Keep only safe characters: alphanumeric, space, hyphen, underscore
+    safe_name = re.sub(r"[^a-zA-Z0-9\s\-_]", "", name)
+
+    # Collapse multiple spaces
+    safe_name = re.sub(r"\s+", " ", safe_name).strip()
+
+    # Truncate to max length
+    if len(safe_name) > max_length:
+        safe_name = safe_name[:max_length].rstrip()
+
+    # Ensure non-empty
+    return safe_name or "Unknown"
+
+
+def validate_session_id(session_id: str) -> str:
+    """Validate and sanitize a session ID for safe embedding in comments.
+
+    Session IDs should match the pattern VGL-[0-9a-f]{6}.
+    Invalid IDs are rejected.
+
+    Args:
+        session_id: The session ID to validate
+
+    Returns:
+        Valid session ID, or empty string if invalid
+    """
+    if not session_id:
+        return ""
+
+    # Match pattern: VGL-[0-9a-f]{6}
+    if re.match(r"^VGL-[0-9a-f]{6}$", session_id):
+        return session_id
+
+    # Invalid — return empty
+    return ""
+
+
+def embed_json_metadata(metadata: dict) -> str:
+    """Embed finding metadata as HTML comment for robust comment parsing.
+
+    Creates an HTML comment block with JSON metadata that can be reliably
+    extracted regardless of markdown formatting changes.
+
+    Format: <!-- vigil-meta: {...} -->
+
+    Args:
+        metadata: Dict with keys like severity, category, message, suggestion, fingerprint
+
+    Returns:
+        HTML comment string
+    """
+    import json
+
+    try:
+        json_str = json.dumps(metadata, separators=(",", ":"))
+        return f"<!-- vigil-meta: {json_str} -->"
+    except (TypeError, ValueError) as e:
+        # If serialization fails, return empty comment
+        import logging
+
+        logging.warning("Failed to serialize metadata to JSON: %s", e)
+        return ""

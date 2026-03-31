@@ -12,6 +12,7 @@ This enables finding matching even when:
 """
 
 import hashlib
+import json
 import logging
 import re
 from typing import NamedTuple
@@ -136,6 +137,9 @@ def extract_finding_from_comment(
     This allows us to reconstruct findings from existing comments to compare
     with newly generated findings.
 
+    Tries JSON metadata first (future-proof), then falls back to regex parsing (backward-compatible).
+    Regex parsing is hardened against ReDoS with input length limits and bounded quantifiers.
+
     Args:
         comment_body: The full Vigil comment body (markdown)
         file_path: The file path from GitHub comment metadata
@@ -146,10 +150,111 @@ def extract_finding_from_comment(
     """
     from .models import Severity
 
+    # Limit input to prevent ReDoS attacks
+    max_comment_length = 10000
+    if len(comment_body) > max_comment_length:
+        log.warning(
+            "Comment body exceeds max length (%d > %d), truncating for parsing",
+            len(comment_body),
+            max_comment_length,
+        )
+        comment_body = comment_body[:max_comment_length]
+
+    # Try JSON metadata extraction first (issue #13)
+    finding = _extract_finding_from_json_metadata(comment_body, file_path, line)
+    if finding:
+        return finding
+
+    # Fall back to regex parsing (backward-compatible)
+    return _extract_finding_from_regex(comment_body, file_path, line)
+
+
+def _extract_finding_from_json_metadata(
+    comment_body: str,
+    file_path: str | None,
+    line: int | None,
+) -> "Finding | None":
+    """Try to extract Finding from embedded JSON metadata.
+
+    Looks for HTML comment with structure:
+    <!-- vigil-meta: {"severity":"high","category":"SQL Injection",...} -->
+
+    Args:
+        comment_body: The full comment body
+        file_path: File path from GitHub metadata
+        line: Line number from GitHub metadata
+
+    Returns:
+        Reconstructed Finding, or None if metadata not found
+    """
+    from .models import Severity
+
+    # Look for vigil-meta JSON block
+    # Pattern: <!-- vigil-meta: {...} -->
+    pattern = r"<!--\s*vigil-meta:\s*({[^}]*})\s*-->"
+    match = re.search(pattern, comment_body)
+    if not match:
+        return None
+
+    try:
+        metadata = json.loads(match.group(1))
+
+        # Extract required fields
+        severity_str = metadata.get("severity", "").lower()
+        category = metadata.get("category", "unknown")
+        message = metadata.get("message", "")
+
+        if not severity_str or not message:
+            return None
+
+        # Map severity
+        sev_map = {
+            "critical": Severity.critical,
+            "high": Severity.high,
+            "medium": Severity.medium,
+            "low": Severity.low,
+        }
+        severity = sev_map.get(severity_str)
+        if not severity:
+            return None
+
+        return Finding(
+            file=file_path or "unknown",
+            line=line,
+            severity=severity,
+            category=category,
+            message=message,
+            suggestion=metadata.get("suggestion"),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        log.debug("Failed to parse JSON metadata: %s", e)
+        return None
+
+
+def _extract_finding_from_regex(
+    comment_body: str,
+    file_path: str | None,
+    line: int | None,
+) -> "Finding | None":
+    """Extract Finding from regex-based markdown parsing (backward-compatible).
+
+    Hardened against ReDoS with bounded quantifiers and input validation.
+
+    Args:
+        comment_body: The full comment body
+        file_path: File path from GitHub metadata
+        line: Line number from GitHub metadata
+
+    Returns:
+        Reconstructed Finding, or None if parsing fails
+    """
+    from .models import Severity
+
     # Extract severity from tags like **[CRITICAL]**, **[HIGH]**, etc.
     sev_match = re.search(r"\*\*\[(CRITICAL|HIGH|MEDIUM|LOW)\]\*\*", comment_body)
     if not sev_match:
         return None
+
     sev_str = sev_match.group(1).lower()
     sev_map = {
         "critical": Severity.critical,
@@ -160,7 +265,11 @@ def extract_finding_from_comment(
     severity = sev_map.get(sev_str, Severity.medium)
 
     # Extract category from [CategoryName] tags
-    cat_match = re.search(r"\[([\w\s]+)\]", comment_body[sev_match.end():])
+    # Use bounded quantifier {1,100} to prevent ReDoS
+    # Restrict character class to be more specific (word chars, space, slash, hyphen)
+    cat_match = re.search(
+        r"\[([\w\s/\-]{1,100})\]", comment_body[sev_match.end() :]
+    )
     category = cat_match.group(1).strip() if cat_match else "unknown"
 
     # Extract message: everything after the header, before suggestion

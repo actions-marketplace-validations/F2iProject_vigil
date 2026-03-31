@@ -473,3 +473,95 @@ class TestMergeWithVerdictInfo:
         verdicts_by_spec = {v.specialist: v for v in merged[0].verdict_info}
         assert verdicts_by_spec["Architecture"].category == "Resource Lifecycle Management"
         assert verdicts_by_spec["Performance"].category == "Memory Management"
+
+
+class TestXssSanitization:
+    """Test XSS prevention in comment formatting (issue #12)."""
+
+    def test_sanitizes_llm_generated_message(self):
+        """LLM-generated message should be sanitized to prevent XSS."""
+        # Malicious message from LLM
+        malicious_msg = "Check this: <script>alert('xss')</script> dangerous!"
+        f = Finding(
+            file="src/file.py", line=42, severity=Severity.high,
+            category="Issue", message=malicious_msg
+        )
+        result = format_merged_finding_comment(f, ["Security"])
+        # XSS payload should be removed
+        assert "<script>" not in result
+        assert "alert" not in result
+
+    def test_sanitizes_llm_generated_category(self):
+        """LLM-generated category should be sanitized."""
+        malicious_cat = "SQL Injection<img src=x onerror='alert(1)'>"
+        f = Finding(
+            file="src/file.py", line=42, severity=Severity.high,
+            category=malicious_cat, message="Issue"
+        )
+        result = format_merged_finding_comment(f, ["Security"])
+        # HTML injection should be removed
+        assert "<img" not in result
+        assert "onerror" not in result
+
+    def test_sanitizes_llm_generated_suggestion(self):
+        """LLM-generated suggestion should be sanitized."""
+        malicious_sugg = "Use this: <svg/onload=alert(1)>"
+        f = Finding(
+            file="src/file.py", line=42, severity=Severity.high,
+            category="Issue", message="Problem",
+            suggestion=malicious_sugg
+        )
+        result = format_merged_finding_comment(f, ["Security"])
+        # SVG injection should be removed
+        assert "<svg" not in result
+        assert "onload" not in result
+
+    def test_validates_specialist_names(self):
+        """Specialist names with special chars should be validated."""
+        # Try to inject markdown/HTML via specialist name
+        malicious_name = "Security<script>"
+        f = Finding(
+            file="src/file.py", line=42, severity=Severity.high,
+            category="Issue", message="Problem"
+        )
+        result = format_merged_finding_comment(f, [malicious_name])
+        # Malicious chars should be stripped
+        assert "<script>" not in result
+        assert "Security" in result
+
+    def test_validates_session_ids(self):
+        """Invalid session IDs should be rejected."""
+        f = Finding(
+            file="src/file.py", line=42, severity=Severity.high,
+            category="Issue", message="Problem"
+        )
+        # Malicious session ID
+        session_ids = {"Security": "'; drop table findings; --"}
+        result = format_merged_finding_comment(f, ["Security"], session_ids)
+        # Invalid session ID should not appear
+        assert "drop table" not in result
+        assert ";" not in result
+
+    def test_verdict_info_sanitizes_category(self):
+        """Category in verdict info should be sanitized."""
+        f = Finding(
+            file="src/file.py", line=42, severity=Severity.high,
+            category="Issue", message="Problem"
+        )
+        malicious_cat = "Category<img src=x onerror='alert(1)'>"
+        verdict_info = [
+            VerdictInfo(
+                specialist="Security",
+                verdict="REQUEST_CHANGES",
+                category=malicious_cat,
+                session_id="VGL-abc123"
+            )
+        ]
+        result = format_merged_finding_comment(
+            f, ["Security"],
+            verdict_info=verdict_info,
+            total_specialists=1
+        )
+        # HTML injection should be removed from verdict info
+        assert "<img" not in result
+        assert "onerror" not in result

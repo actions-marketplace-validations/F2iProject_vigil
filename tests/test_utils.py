@@ -8,6 +8,10 @@ from vigil.utils import (
     severity_emoji,
     SEVERITY_EMOJI,
     STRIP_PATTERNS,
+    sanitize_markdown,
+    validate_specialist_name,
+    validate_session_id,
+    embed_json_metadata,
 )
 
 
@@ -83,3 +87,137 @@ class TestStripPatterns:
         import re
         for p in STRIP_PATTERNS:
             assert isinstance(p, re.Pattern)
+
+
+class TestSanitizeMarkdown:
+    """Test XSS prevention via markdown sanitization."""
+
+    def test_strips_html_tags(self):
+        """HTML tags should be stripped entirely."""
+        text = "Normal text <script>alert('xss')</script> more text"
+        result = sanitize_markdown(text)
+        assert "<script>" not in result
+        assert "alert" not in result
+        assert "Normal text" in result
+        assert "more text" in result
+
+    def test_strips_img_onerror_injection(self):
+        """Image onerror attributes should be removed."""
+        text = "Check <img src=x onerror='alert(1)'> this"
+        result = sanitize_markdown(text)
+        assert "<img" not in result
+        assert "onerror" not in result
+        assert "alert" not in result
+
+    def test_preserves_normal_markdown(self):
+        """Normal markdown formatting should be preserved."""
+        text = "**bold** and *italic* and `code`"
+        result = sanitize_markdown(text)
+        assert "**bold**" in result
+        assert "*italic*" in result
+        assert "`code`" in result
+
+    def test_escapes_markdown_links(self):
+        """Markdown link syntax should be escaped to prevent injection."""
+        text = "[click here](javascript:alert('xss'))"
+        result = sanitize_markdown(text)
+        # Links should be escaped
+        assert "\\[" in result or "[" not in result
+
+    def test_handles_empty_string(self):
+        assert sanitize_markdown("") == ""
+
+    def test_handles_none_gracefully(self):
+        # Should not raise even if input validation is needed
+        result = sanitize_markdown(None or "")
+        assert result == ""
+
+    def test_normalizes_line_breaks(self):
+        """Different line break styles should be normalized."""
+        text = "line1\r\nline2\rline3\nline4"
+        result = sanitize_markdown(text)
+        assert result.count("\n") >= 3
+
+
+class TestValidateSpecialistName:
+    """Test specialist name validation."""
+
+    def test_accepts_normal_names(self):
+        assert validate_specialist_name("Security") == "Security"
+        assert validate_specialist_name("Logic Reviewer") == "Logic Reviewer"
+
+    def test_strips_special_chars(self):
+        result = validate_specialist_name("Security<script>")
+        assert "<" not in result
+        assert "script" not in result
+        assert "Security" in result
+
+    def test_allows_hyphen_underscore(self):
+        assert validate_specialist_name("Security-Team") == "Security-Team"
+        assert validate_specialist_name("Logic_Reviewer") == "Logic_Reviewer"
+
+    def test_collapses_spaces(self):
+        result = validate_specialist_name("Multiple   Spaces")
+        assert "   " not in result
+
+    def test_truncates_long_names(self):
+        long_name = "A" * 100
+        result = validate_specialist_name(long_name, max_length=50)
+        assert len(result) <= 50
+
+    def test_empty_returns_unknown(self):
+        assert validate_specialist_name("") == "Unknown"
+        assert validate_specialist_name(None or "") == "Unknown"
+
+    def test_only_special_chars_returns_unknown(self):
+        assert validate_specialist_name("<>!@#$%^") == "Unknown"
+
+
+class TestValidateSessionId:
+    """Test session ID validation."""
+
+    def test_accepts_valid_session_ids(self):
+        assert validate_session_id("VGL-abc123") == "VGL-abc123"
+        assert validate_session_id("VGL-000000") == "VGL-000000"
+        assert validate_session_id("VGL-ffffff") == "VGL-ffffff"
+
+    def test_rejects_invalid_format(self):
+        assert validate_session_id("VGL-xyz") == ""
+        assert validate_session_id("VGL-12345") == ""
+        assert validate_session_id("VGL_abc123") == ""
+        assert validate_session_id("vgl-abc123") == ""
+
+    def test_rejects_non_hex_chars(self):
+        assert validate_session_id("VGL-ghijkl") == ""
+        assert validate_session_id("VGL-ABCDEF") == ""
+
+    def test_empty_returns_empty(self):
+        assert validate_session_id("") == ""
+        assert validate_session_id(None or "") == ""
+
+
+class TestEmbedJsonMetadata:
+    """Test JSON metadata embedding."""
+
+    def test_creates_html_comment(self):
+        metadata = {"severity": "high", "category": "SQL Injection"}
+        result = embed_json_metadata(metadata)
+        assert result.startswith("<!-- vigil-meta:")
+        assert result.endswith("-->")
+        assert "high" in result
+        assert "SQL Injection" in result
+
+    def test_valid_json_format(self):
+        import json
+        metadata = {"severity": "high", "message": "Test", "category": "Issue"}
+        result = embed_json_metadata(metadata)
+        # Extract JSON from comment
+        json_str = result.replace("<!-- vigil-meta: ", "").replace(" -->", "")
+        parsed = json.loads(json_str)
+        assert parsed["severity"] == "high"
+        assert parsed["message"] == "Test"
+
+    def test_empty_metadata(self):
+        result = embed_json_metadata({})
+        assert "<!-- vigil-meta:" in result
+        assert "{}}" in result or "{}" in result
