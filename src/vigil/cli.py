@@ -18,7 +18,7 @@ from .comment_manager import (
     resolve_dismissed_threads,
 )
 from .decision_log import clear_decisions, get_decisions, remove_decision
-from .diff_parser import commentable_lines, parse_diff, reassemble_diff
+from .diff_parser import commentable_lines, parse_diff
 from .github import get_changed_files_between_commits, get_pr_data, parse_pr_url
 from .github_review import post_review, react, remove_reaction
 from .issue_manager import create_issues_for_observations
@@ -162,8 +162,8 @@ def review(
             console.print(f"[dim]Incremental review: {len(changed_files)} file(s) changed since {last_sha[:7]}[/dim]")
 
             # Auto-resolve threads at changed lines
+            # Build line map ONLY for changed files (to auto-resolve outdated threads)
             incremental_lines = commentable_lines(pr_data["diff"])
-            # Narrow to only files that changed since last review
             changed_set = set(changed_files)
             changed_line_map = {f: lines for f, lines in incremental_lines.items() if f in changed_set}
             resolved = resolve_addressed_threads(
@@ -172,10 +172,11 @@ def review(
             if resolved:
                 console.print(f"[dim]Auto-resolved {resolved} outdated thread(s)[/dim]")
 
-            # Filter diff to only changed files for specialist review
-            all_hunks = parse_diff(pr_data["diff"])
-            filtered_hunks = [h for h in all_hunks if h.path in changed_set]
-            review_diff_text = reassemble_diff(filtered_hunks)
+            # IMPORTANT: Review the FULL PR diff, not just changed files.
+            # This ensures we see all commits in the PR, not just the latest one.
+            # The full diff is against the base branch (e.g., main), so it includes
+            # all changes from all commits, which is what we want.
+            review_diff_text = pr_data["diff"]
 
         except typer.Exit:
             raise
