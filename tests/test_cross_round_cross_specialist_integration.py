@@ -8,6 +8,7 @@ from vigil.context_manager import (
     filter_cross_round_duplicates,
 )
 from vigil.cross_specialist_dedup import (
+    VerdictInfo,
     format_merged_finding_comment,
     merge_specialist_findings,
     annotate_findings_with_specialist_context,
@@ -348,3 +349,92 @@ class TestAnnotateWithSpecialistContext:
         unique_item = next((a for a in annotated if not a["is_merged"]), None)
         assert unique_item is not None
         assert unique_item["count"] == 0
+
+
+class TestEndToEndConsensusFlow:
+    """End-to-end test of consensus table generation."""
+
+    def test_consensus_table_end_to_end(self):
+        """Test full flow: merge findings -> format with consensus table."""
+        # Simulate 3 specialists finding the same issue with different category labels
+        f1 = Finding(
+            file="src/adapter.py",
+            line=15,
+            severity=Severity.critical,
+            category="Resource Lifecycle Management",
+            message="The `PlatformAuditAdapter` uses an in-memory `deque` as its WAL buffer, "
+                    "which is lost on process termination. This violates write-ahead logging guarantees.",
+            suggestion="Replace the in-memory `deque` with a persistent storage mechanism.",
+        )
+        f2 = Finding(
+            file="src/adapter.py",
+            line=15,
+            severity=Severity.critical,
+            category="Data Integrity / Compliance",
+            message="The `PlatformAuditAdapter` uses an in-memory `deque` as its WAL buffer, "
+                    "which is lost on process termination. This violates write-ahead logging guarantees.",
+            suggestion="Replace the in-memory `deque` with a persistent storage mechanism.",
+        )
+        f3 = Finding(
+            file="src/adapter.py",
+            line=15,
+            severity=Severity.high,
+            category="Memory Leak / Unbounded Data Structure",
+            message="The `PlatformAuditAdapter` uses an in-memory `deque` as its WAL buffer, "
+                    "which is lost on process termination. This violates write-ahead logging guarantees.",
+            suggestion="Replace the in-memory `deque` with a persistent storage mechanism.",
+        )
+
+        v1 = PersonaVerdict(
+            persona="Architecture",
+            session_id="VGL-ddd629",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f1],
+            observations=[],
+        )
+        v2 = PersonaVerdict(
+            persona="Testing",
+            session_id="VGL-7dbc2f",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f2],
+            observations=[],
+        )
+        v3 = PersonaVerdict(
+            persona="Performance",
+            session_id="VGL-62c24e",
+            decision="REQUEST_CHANGES",
+            checks={},
+            findings=[f3],
+            observations=[],
+        )
+
+        # Merge findings
+        deduped, merged = merge_specialist_findings([v1, v2, v3])
+
+        assert len(deduped) == 1, "Should merge 3 findings into 1"
+        assert len(merged) == 1, "Should have 1 merged group"
+        assert merged[0].count == 3, "Should show 3 specialists"
+
+        # Format with consensus table
+        result = format_merged_finding_comment(
+            merged[0].finding,
+            merged[0].specialists,
+            verdict_info=merged[0].verdict_info,
+            total_specialists=6,
+        )
+
+        # Verify consensus table is present and correct
+        assert "📊 **Consensus (3/6 specialists)**" in result
+        assert "Architecture" in result
+        assert "Testing" in result
+        assert "Performance" in result
+        assert "VGL-ddd629" in result
+        assert "VGL-7dbc2f" in result
+        assert "VGL-62c24e" in result
+        assert "Resource Lifecycle Management" in result
+        assert "Data Integrity / Compliance" in result
+        assert "Memory Leak / Unbounded Data Structure" in result
+        assert "PlatformAuditAdapter" in result
+        assert "Replace the in-memory" in result
