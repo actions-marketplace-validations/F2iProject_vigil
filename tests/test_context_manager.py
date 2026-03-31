@@ -375,6 +375,30 @@ class TestExtractFindingFromJsonMetadata:
         result = _extract_finding_from_json_metadata(body, "src/file.py", 42)
         assert result is None
 
+    def test_handles_values_with_closing_brace(self):
+        """JSON values containing '}' should be parsed correctly (non-greedy regex)."""
+        body = (
+            '<!-- vigil-meta: '
+            '{"severity":"high","category":"Logic","message":"Missing } in template"} '
+            '-->'
+        )
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 10)
+        assert result is not None
+        assert result.message == "Missing } in template"
+
+    def test_handles_nested_json_objects(self):
+        """Nested JSON objects should not break extraction."""
+        # While current metadata schema is flat, the regex should not choke
+        # on values that happen to contain braces
+        body = (
+            '<!-- vigil-meta: '
+            '{"severity":"medium","category":"Format","message":"Check {braces} usage"} '
+            '-->'
+        )
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 5)
+        assert result is not None
+        assert "{braces}" in result.message
+
 
 class TestExtractFindingFromRegex:
     """Test regex-based extraction with ReDoS protection (issue #11)."""

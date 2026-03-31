@@ -22,6 +22,10 @@ from .utils import content_fingerprint, extract_message_content
 
 log = logging.getLogger(__name__)
 
+# Pre-compiled regex for extracting JSON metadata from Vigil HTML comments.
+# Uses non-greedy .*? to handle nested objects and values containing '}'.
+_VIGIL_META_PATTERN = re.compile(r"<!--\s*vigil-meta:\s*(\{.*?\})\s*-->")
+
 
 class FindingFingerprint(NamedTuple):
     """Unique identifier for a finding pattern."""
@@ -189,10 +193,9 @@ def _extract_finding_from_json_metadata(
     """
     from .models import Severity
 
-    # Look for vigil-meta JSON block
-    # Pattern: <!-- vigil-meta: {...} -->
-    pattern = r"<!--\s*vigil-meta:\s*({[^}]*})\s*-->"
-    match = re.search(pattern, comment_body)
+    # Use pre-compiled module-level pattern for JSON metadata extraction.
+    # Non-greedy .*? correctly handles nested JSON and values containing '}'.
+    match = _VIGIL_META_PATTERN.search(comment_body)
     if not match:
         return None
 

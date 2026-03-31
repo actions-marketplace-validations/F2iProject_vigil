@@ -229,3 +229,9 @@ class TestEmbedJsonMetadata:
         result = embed_json_metadata({})
         assert "<!-- vigil-meta:" in result
         assert "{}}" in result or "{}" in result
+
+    def test_unserializable_value_returns_empty(self):
+        """Non-serializable values should return empty string, not raise."""
+        metadata = {"bad_value": object()}
+        result = embed_json_metadata(metadata)
+        assert result == ""
