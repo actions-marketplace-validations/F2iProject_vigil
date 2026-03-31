@@ -488,3 +488,302 @@ class TestJsonMetadataFallback:
         body = "Just a regular comment with no structured data"
         result = extract_finding_from_comment(body, "src/file.py", 42)
         assert result is None
+
+
+class TestSpatialLookup:
+    """Test spatial line range lookup optimization for large candidate lists."""
+
+    def test_find_overlapping_with_exact_match(self):
+        """Test finding overlapping fingerprints with exact line match."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="abc123def456",
+            line_range=(40, 44),
+        )
+
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="abc123def456",
+                line_range=(40, 44),  # Exact match
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="different_hash",
+                line_range=(40, 44),
+            ),
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        assert len(result) == 1
+        assert result[0].message_hash == "abc123def456"
+
+    def test_find_overlapping_with_shifted_lines(self):
+        """Test finding overlapping fingerprints when lines are shifted."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="abc123def456",
+            line_range=(40, 44),
+        )
+
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="abc123def456",
+                line_range=(42, 46),  # Overlaps with target
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="abc123def456",
+                line_range=(50, 55),  # No overlap
+            ),
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        assert len(result) == 1
+        assert result[0].line_range == (42, 46)
+
+    def test_find_overlapping_with_unlocated(self):
+        """Test that unlocated findings match everything."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="abc123def456",
+            line_range=(0, 0),  # Unlocated
+        )
+
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="abc123def456",
+                line_range=(10, 20),
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="abc123def456",
+                line_range=(100, 200),
+            ),
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        assert len(result) == 2, "Unlocated target should match all candidates"
+
+    def test_find_overlapping_filters_by_message_hash(self):
+        """Test that message_hash is still used for filtering."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="target_hash",
+            line_range=(40, 44),
+        )
+
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="target_hash",
+                line_range=(40, 44),  # Matches
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="different_hash",
+                line_range=(40, 44),  # Same line but different hash
+            ),
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        assert len(result) == 1
+        assert result[0].message_hash == "target_hash"
+
+    def test_find_overlapping_with_many_candidates(self):
+        """Test spatial lookup with many candidates."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="target_hash",
+            line_range=(50, 55),
+        )
+
+        # Create 100 candidates at various line ranges
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="target_hash",
+                line_range=(i, i + 4),
+            )
+            for i in range(0, 200, 2)
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        # Should find only those that overlap with (50, 55)
+        # Overlapping ranges: those where end >= 50 and start <= 55
+        assert len(result) > 0
+        for fp in result:
+            start, end = fp.line_range
+            # Verify overlap: not (end < 50 or start > 55)
+            assert not (end < 50 or start > 55)
+
+    def test_filter_with_spatial_lookup_threshold(self):
+        """Test that filter_cross_round_duplicates uses spatial lookup for large lists."""
+        # Create many existing findings
+        existing_comments = []
+        for i in range(20):
+            existing_comments.append({
+                "path": "src/queries.py",
+                "line": i * 10,
+                "body": "🟠 **[HIGH]** [SQL Injection]\n\nDangerous query",
+            })
+
+        # New finding that matches one of them (by line range overlap)
+        new_finding = Finding(
+            file="src/queries.py",
+            line=25,  # Should match the finding at line 20 (within context)
+            severity=Severity.high,
+            category="SQL Injection",
+            message="Dangerous query",
+        )
+
+        # With spatial_lookup_threshold=10, should use binary search
+        result = filter_cross_round_duplicates(
+            [new_finding],
+            existing_comments,
+            spatial_lookup_threshold=10,
+        )
+
+        assert len(result) == 0, "Should filter duplicate found via spatial lookup"
+
+    def test_filter_fallback_to_linear_scan(self):
+        """Test that small candidate lists use linear scan (below threshold)."""
+        # Create just 5 existing findings
+        existing_comments = [
+            {
+                "path": "src/auth.py",
+                "line": 10,
+                "body": "🟠 **[HIGH]** [SQL Injection]\n\nDangerous query",
+            },
+            {
+                "path": "src/auth.py",
+                "line": 20,
+                "body": "🟠 **[HIGH]** [SQL Injection]\n\nDangerous query",
+            },
+            {
+                "path": "src/auth.py",
+                "line": 30,
+                "body": "🟠 **[HIGH]** [SQL Injection]\n\nDangerous query",
+            },
+        ]
+
+        new_finding = Finding(
+            file="src/auth.py",
+            line=28,  # Close to line 30
+            severity=Severity.high,
+            category="SQL Injection",
+            message="Dangerous query",
+        )
+
+        # With threshold=10, 3 candidates should use linear scan
+        result = filter_cross_round_duplicates(
+            [new_finding],
+            existing_comments,
+            spatial_lookup_threshold=10,
+        )
+
+        assert len(result) == 0, "Should filter using linear scan"
+
+    def test_spatial_lookup_non_overlapping_ranges(self):
+        """Test that non-overlapping ranges are correctly excluded."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="target_hash",
+            line_range=(100, 105),
+        )
+
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="target_hash",
+                line_range=(10, 20),  # Too low
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="target_hash",
+                line_range=(200, 210),  # Too high
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="target_hash",
+                line_range=(100, 105),  # Exact match
+            ),
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        assert len(result) == 1
+        assert result[0].line_range == (100, 105)
+
+    def test_no_duplicates_when_candidates_share_start_line(self):
+        """Test that multiple candidates at same start line are returned once each."""
+        from vigil.context_manager import _find_overlapping_fingerprints
+
+        # Target at line 15 with range (13, 17)
+        target = FindingFingerprint(
+            file="src/auth.py",
+            category="SQL Injection",
+            message_hash="shared_hash",
+            line_range=(13, 17),
+        )
+
+        # Three candidates all starting at line 10, all with matching message_hash
+        candidates = [
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="shared_hash",
+                line_range=(10, 20),  # Overlaps with target
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="shared_hash",
+                line_range=(10, 25),  # Overlaps with target
+            ),
+            FindingFingerprint(
+                file="src/auth.py",
+                category="SQL Injection",
+                message_hash="shared_hash",
+                line_range=(10, 30),  # Overlaps with target
+            ),
+        ]
+
+        result = _find_overlapping_fingerprints(target, candidates)
+        # All three should be returned (they all overlap)
+        assert len(result) == 3
+        # Each should appear exactly once (no duplicates)
+        assert result[0].line_range == (10, 20)
+        assert result[1].line_range == (10, 25)
+        assert result[2].line_range == (10, 30)
