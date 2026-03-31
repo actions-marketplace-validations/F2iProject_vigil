@@ -333,8 +333,14 @@ def _parse_finding_from_comment(body: str, path: str | None, line: int | None) -
 
     Extracts severity, category, and message from the formatted comment text.
     Returns a Finding object or None if parsing fails.
+    Hardened against ReDoS with input length limits and bounded quantifiers.
     """
     from .models import Finding, Severity
+
+    # Limit input to prevent ReDoS attacks
+    max_body_length = 10000
+    if len(body) > max_body_length:
+        body = body[:max_body_length]
 
     # Extract severity from tags like **[CRITICAL]**, **[HIGH]**, etc.
     sev_match = re.search(r"\*\*\[(CRITICAL|HIGH|MEDIUM|LOW)\]\*\*", body)
@@ -346,7 +352,9 @@ def _parse_finding_from_comment(body: str, path: str | None, line: int | None) -
     severity = sev_map.get(sev_str, Severity.medium)
 
     # Extract category from [CategoryName] tags
-    cat_match = re.search(r"\[([\w\s]+)\]", body[sev_match.end():])
+    # Use bounded quantifier {1,100} to prevent ReDoS
+    # Restrict character class to be more specific (word chars, space, slash, hyphen)
+    cat_match = re.search(r"\[([\w\s/\-]{1,100})\]", body[sev_match.end():])
     category = cat_match.group(1).strip() if cat_match else "unknown"
 
     # Extract message: everything after the header line(s), before suggestion

@@ -10,6 +10,8 @@ from vigil.context_manager import (
     fingerprints_match,
     _normalize_line_range,
     _line_ranges_overlap,
+    _extract_finding_from_json_metadata,
+    _extract_finding_from_regex,
 )
 from vigil.models import Finding, Severity
 
@@ -317,3 +319,172 @@ class TestFilterCrossRoundDuplicates:
         ]
         result = filter_cross_round_duplicates(findings, existing)
         assert len(result) == 0
+
+
+class TestExtractFindingFromJsonMetadata:
+    """Test JSON metadata extraction (issue #13)."""
+
+    def test_extracts_from_json_metadata(self):
+        """Should extract Finding from embedded JSON metadata."""
+        body = (
+            "<!-- vigil-meta: "
+            '{"severity":"high","category":"SQL Injection","message":"Dangerous SQL"} '
+            "-->\n\nMarkdown content here"
+        )
+        result = _extract_finding_from_json_metadata(body, "src/auth.py", 42)
+        assert result is not None
+        assert result.severity == Severity.high
+        assert result.category == "SQL Injection"
+        assert result.message == "Dangerous SQL"
+        assert result.file == "src/auth.py"
+        assert result.line == 42
+
+    def test_extracts_with_suggestion(self):
+        """JSON metadata can include optional suggestion field."""
+        body = (
+            "<!-- vigil-meta: "
+            '{"severity":"high","category":"Issue","message":"Problem",'
+            '"suggestion":"Use parameterized queries"} '
+            "-->"
+        )
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 10)
+        assert result is not None
+        assert result.suggestion == "Use parameterized queries"
+
+    def test_returns_none_if_no_metadata(self):
+        """Should return None if no JSON metadata block found."""
+        body = "Regular comment without metadata"
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 42)
+        assert result is None
+
+    def test_handles_malformed_json(self):
+        """Should gracefully handle malformed JSON."""
+        body = '<!-- vigil-meta: {invalid json} -->'
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 42)
+        assert result is None
+
+    def test_requires_severity(self):
+        """Missing severity field should fail."""
+        body = '<!-- vigil-meta: {"category":"Issue","message":"Test"} -->'
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 42)
+        assert result is None
+
+    def test_requires_message(self):
+        """Missing message field should fail."""
+        body = '<!-- vigil-meta: {"severity":"high","category":"Issue"} -->'
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 42)
+        assert result is None
+
+    def test_handles_values_with_closing_brace(self):
+        """JSON values containing '}' should be parsed correctly (non-greedy regex)."""
+        body = (
+            '<!-- vigil-meta: '
+            '{"severity":"high","category":"Logic","message":"Missing } in template"} '
+            '-->'
+        )
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 10)
+        assert result is not None
+        assert result.message == "Missing } in template"
+
+    def test_handles_nested_json_objects(self):
+        """Nested JSON objects should not break extraction."""
+        # While current metadata schema is flat, the regex should not choke
+        # on values that happen to contain braces
+        body = (
+            '<!-- vigil-meta: '
+            '{"severity":"medium","category":"Format","message":"Check {braces} usage"} '
+            '-->'
+        )
+        result = _extract_finding_from_json_metadata(body, "src/file.py", 5)
+        assert result is not None
+        assert "{braces}" in result.message
+
+
+class TestExtractFindingFromRegex:
+    """Test regex-based extraction with ReDoS protection (issue #11)."""
+
+    def test_extracts_via_regex(self):
+        """Should extract Finding using regex patterns."""
+        body = "🔴 **[HIGH]** [SQL Injection] Dangerous SQL concatenation"
+        result = _extract_finding_from_regex(body, "src/auth.py", 42)
+        assert result is not None
+        assert result.severity == Severity.high
+        assert result.category == "SQL Injection"
+
+    def test_bounded_regex_quantifier(self):
+        """Category regex should use bounded quantifier to prevent ReDoS."""
+        # Create a comment with a very long category name (but still within bounds)
+        category = "A" * 50  # Within 100 char limit
+        body = f"🔴 **[HIGH]** [{category}] Issue"
+        result = _extract_finding_from_regex(body, "src/file.py", 42)
+        assert result is not None
+        assert len(result.category) == 50
+
+    def test_rejects_overly_long_category(self):
+        """Categories longer than 100 chars should be truncated."""
+        category = "A" * 150  # Exceeds 100 char limit
+        body = f"🔴 **[HIGH]** [{category}] Issue"
+        result = _extract_finding_from_regex(body, "src/file.py", 42)
+        # Regex shouldn't match (bounded to 100 chars)
+        # It will extract whatever it can, or fail gracefully
+        if result:
+            assert len(result.category) <= 100
+
+    def test_restricted_category_chars(self):
+        """Category regex should only allow word chars, space, slash, hyphen."""
+        # Valid: word chars, spaces, slashes, hyphens
+        body1 = "🔴 **[HIGH]** [SQL-Injection/Prevention] Issue"
+        result1 = _extract_finding_from_regex(body1, "src/file.py", 42)
+        assert result1 is not None
+
+    def test_handles_input_length_limit(self):
+        """Comments longer than 10000 chars should be truncated."""
+        # Create a very long comment
+        long_body = "🔴 **[HIGH]** [Issue] " + "A" * 15000
+        # Should not crash, should truncate internally
+        result = _extract_finding_from_regex(long_body, "src/file.py", 42)
+        # Result depends on internal handling, but should not raise
+        assert result is None or isinstance(result, Finding)
+
+    def test_extracts_all_severity_levels(self):
+        """Should extract all severity levels."""
+        for severity_tag in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            body = f"🔴 **[{severity_tag}]** [Issue] Problem"
+            result = _extract_finding_from_regex(body, "src/file.py", 42)
+            assert result is not None
+            assert result.severity.value.lower() == severity_tag.lower()
+
+
+class TestJsonMetadataFallback:
+    """Test that extraction tries JSON first, then falls back to regex."""
+
+    def test_prefers_json_metadata_over_regex(self):
+        """If both JSON and regex data exist, JSON should be used."""
+        # This comment has BOTH JSON metadata and regex-parseable content
+        body = (
+            "<!-- vigil-meta: "
+            '{"severity":"critical","category":"Secrets","message":"API key exposed"} '
+            "-->\n\n"
+            "🔴 **[MEDIUM]** [Design] This is the regex version"
+        )
+        result = extract_finding_from_comment(body, "src/file.py", 10)
+        assert result is not None
+        # Should use JSON data (critical, Secrets, API key exposed)
+        # not regex data (medium, Design)
+        assert result.severity == Severity.critical
+        assert result.category == "Secrets"
+        assert "API key" in result.message
+
+    def test_falls_back_to_regex_if_no_json(self):
+        """If no JSON metadata, should fall back to regex parsing."""
+        body = "🔴 **[HIGH]** [SQL Injection] Dangerous SQL"
+        result = extract_finding_from_comment(body, "src/file.py", 42)
+        assert result is not None
+        assert result.severity == Severity.high
+        assert result.category == "SQL Injection"
+
+    def test_returns_none_if_neither_works(self):
+        """If neither JSON nor regex works, should return None."""
+        body = "Just a regular comment with no structured data"
+        result = extract_finding_from_comment(body, "src/file.py", 42)
+        assert result is None

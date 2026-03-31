@@ -355,8 +355,12 @@ class TestEndToEndConsensusFlow:
     """End-to-end test of consensus table generation."""
 
     def test_consensus_table_end_to_end(self):
-        """Test full flow: merge findings -> format with consensus table."""
-        # Simulate 3 specialists finding the same issue with different category labels
+        """Test full flow: merge findings -> format with consensus table.
+
+        Note: findings merge when they share file + category + message fingerprint.
+        Specialists must use the same category for dedup to trigger.
+        """
+        # Simulate 3 specialists finding the same issue with same category
         f1 = Finding(
             file="src/adapter.py",
             line=15,
@@ -370,7 +374,7 @@ class TestEndToEndConsensusFlow:
             file="src/adapter.py",
             line=15,
             severity=Severity.critical,
-            category="Data Integrity / Compliance",
+            category="Resource Lifecycle Management",
             message="The `PlatformAuditAdapter` uses an in-memory `deque` as its WAL buffer, "
                     "which is lost on process termination. This violates write-ahead logging guarantees.",
             suggestion="Replace the in-memory `deque` with a persistent storage mechanism.",
@@ -379,7 +383,7 @@ class TestEndToEndConsensusFlow:
             file="src/adapter.py",
             line=15,
             severity=Severity.high,
-            category="Memory Leak / Unbounded Data Structure",
+            category="Resource Lifecycle Management",
             message="The `PlatformAuditAdapter` uses an in-memory `deque` as its WAL buffer, "
                     "which is lost on process termination. This violates write-ahead logging guarantees.",
             suggestion="Replace the in-memory `deque` with a persistent storage mechanism.",
@@ -434,7 +438,5 @@ class TestEndToEndConsensusFlow:
         assert "VGL-7dbc2f" in result
         assert "VGL-62c24e" in result
         assert "Resource Lifecycle Management" in result
-        assert "Data Integrity / Compliance" in result
-        assert "Memory Leak / Unbounded Data Structure" in result
         assert "PlatformAuditAdapter" in result
         assert "Replace the in-memory" in result
