@@ -15,7 +15,12 @@ from .context_manager import (
     fingerprint_finding,
 )
 from .models import Finding, PersonaVerdict, Severity
-from .utils import severity_emoji
+from .utils import (
+    sanitize_markdown,
+    severity_emoji,
+    validate_session_id,
+    validate_specialist_name,
+)
 
 log = logging.getLogger(__name__)
 
