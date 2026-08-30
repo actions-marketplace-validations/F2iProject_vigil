@@ -9,9 +9,12 @@ from vigil.comment_manager import (
     _is_resolution_reply,
     _issue_covers_finding,
     _parse_finding_from_comment,
+    build_conversation_context,
     deduplicate_comments,
     is_duplicate_finding,
+    resolve_addressed_threads,
     resolve_threads_batch,
+    resolve_vigil_threads_on_approval,
     VIGIL_SESSION_PATTERN,
 )
 
@@ -249,6 +252,221 @@ class TestResolveThreadsBatch:
         assert result == []
 
 
+# ---------- resolve_addressed_threads ----------
+
+class TestResolveAddressedThreads:
+
+    def test_resolves_exact_changed_line(self, monkeypatch):
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads",
+            lambda *args: [{
+                "id": "thread-1",
+                "isResolved": False,
+                "path": "src/app.py",
+                "line": 42,
+                "body": "Finding `VGL-abc123`",
+                "comments": [{"body": "Finding `VGL-abc123`", "author": {"login": "vigil"}}],
+            }],
+        )
+        resolved_ids = []
+        monkeypatch.setattr(
+            "vigil.comment_manager.resolve_threads_batch",
+            lambda ids, token: resolved_ids.extend(ids) or ids,
+        )
+
+        count = resolve_addressed_threads("F2iLLC", "demo", 1, "token", {"src/app.py": {42}})
+
+        assert count == 1
+        assert resolved_ids == ["thread-1"]
+
+    def test_resolves_same_file_when_thread_has_reply(self, monkeypatch):
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads",
+            lambda *args: [{
+                "id": "thread-1",
+                "isResolved": False,
+                "path": "tests/test_app.py",
+                "line": 1,
+                "body": "Add regression coverage `VGL-def456`",
+                "comments": [
+                    {"body": "Add regression coverage `VGL-def456`", "author": {"login": "vigil"}},
+                    {"body": "Added malformed-reference tests in the same file.", "author": {"login": "codex"}},
+                ],
+            }],
+        )
+        resolved_ids = []
+        monkeypatch.setattr(
+            "vigil.comment_manager.resolve_threads_batch",
+            lambda ids, token: resolved_ids.extend(ids) or ids,
+        )
+
+        count = resolve_addressed_threads("F2iLLC", "demo", 1, "token", {"tests/test_app.py": {88, 89}})
+
+        assert count == 1
+        assert resolved_ids == ["thread-1"]
+
+    def test_same_file_change_without_reply_does_not_resolve_nearby_thread(self, monkeypatch):
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads",
+            lambda *args: [{
+                "id": "thread-1",
+                "isResolved": False,
+                "path": "src/app.py",
+                "line": 10,
+                "body": "Finding `VGL-abc123`",
+                "comments": [{"body": "Finding `VGL-abc123`", "author": {"login": "vigil"}}],
+            }],
+        )
+        monkeypatch.setattr(
+            "vigil.comment_manager.resolve_threads_batch",
+            lambda ids, token: ids,
+        )
+
+        count = resolve_addressed_threads("F2iLLC", "demo", 1, "token", {"src/app.py": {99}})
+
+        assert count == 0
+
+    def test_reply_without_same_file_change_does_not_resolve_thread(self, monkeypatch):
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads",
+            lambda *args: [{
+                "id": "thread-1",
+                "isResolved": False,
+                "path": "src/app.py",
+                "line": 10,
+                "body": "Finding `VGL-abc123`",
+                "comments": [
+                    {"body": "Finding `VGL-abc123`", "author": {"login": "vigil"}},
+                    {"body": "Handled elsewhere.", "author": {"login": "codex"}},
+                ],
+            }],
+        )
+        monkeypatch.setattr(
+            "vigil.comment_manager.resolve_threads_batch",
+            lambda ids, token: ids,
+        )
+
+        count = resolve_addressed_threads("F2iLLC", "demo", 1, "token", {"src/other.py": {10}})
+
+        assert count == 0
+
+
+# ---------- resolve_vigil_threads_on_approval (issue #61) ----------
+
+def _thread(tid: str, body: str, *, path: str = "src/app.py",
+            line: int = 10, resolved: bool = False) -> dict:
+    """A review thread in the shape fetch_review_threads returns."""
+    return {
+        "id": tid,
+        "isResolved": resolved,
+        "path": path,
+        "line": line,
+        "body": body,
+        "comments": [{"body": body, "path": path, "line": line,
+                      "author": {"login": "vigil"}}],
+    }
+
+
+class TestResolveVigilThreadsOnApproval:
+    """Decision-driven resolution: the diff is not consulted at all.
+
+    The scope under test is every open Vigil thread on the PR, not the current
+    session's. session_id is per-specialist-run (models.py), so the stranded
+    threads this clears necessarily carry other session IDs.
+    """
+
+    def _wire(self, monkeypatch, threads: list[dict]) -> list[str]:
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads", lambda *args: threads,
+        )
+        resolved_ids: list[str] = []
+        monkeypatch.setattr(
+            "vigil.comment_manager.resolve_threads_batch",
+            lambda ids, token: resolved_ids.extend(ids) or ids,
+        )
+        return resolved_ids
+
+    def test_resolves_a_thread_from_an_earlier_session(self, monkeypatch):
+        """The reported shape: the open thread is not from this run."""
+        resolved_ids = self._wire(monkeypatch, [
+            _thread("thread-1", "Finding `VGL-abc123`", path="foo.py"),
+        ])
+
+        count = resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token")
+
+        assert count == 1
+        assert resolved_ids == ["thread-1"]
+
+    def test_resolves_threads_across_several_sessions(self, monkeypatch):
+        resolved_ids = self._wire(monkeypatch, [
+            _thread("thread-1", "Finding `VGL-abc123`", path="foo.py"),
+            _thread("thread-2", "Finding `VGL-def456`", path="bar.py"),
+        ])
+
+        count = resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token")
+
+        assert count == 2
+        assert resolved_ids == ["thread-1", "thread-2"]
+
+    def test_never_resolves_a_human_thread(self, monkeypatch):
+        """The VGL marker is the only thing separating ours from theirs."""
+        resolved_ids = self._wire(monkeypatch, [
+            _thread("human-1", "This naming is confusing to me.", path="foo.py"),
+        ])
+
+        count = resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token")
+
+        assert count == 0
+        assert resolved_ids == []
+
+    def test_resolves_ours_and_leaves_theirs_alone_in_the_same_pr(self, monkeypatch):
+        resolved_ids = self._wire(monkeypatch, [
+            _thread("human-1", "Please rename this.", path="foo.py"),
+            _thread("thread-1", "Finding `VGL-abc123`", path="foo.py"),
+        ])
+
+        count = resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token")
+
+        assert count == 1
+        assert resolved_ids == ["thread-1"]
+
+    def test_skips_already_resolved_threads(self, monkeypatch):
+        resolved_ids = self._wire(monkeypatch, [
+            _thread("thread-1", "Finding `VGL-abc123`", resolved=True),
+        ])
+
+        assert resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token") == 0
+        assert resolved_ids == []
+
+    def test_no_threads_makes_no_mutation_call(self, monkeypatch):
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads", lambda *args: [],
+        )
+
+        def fail(*args, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("resolve_threads_batch must not be called")
+
+        monkeypatch.setattr("vigil.comment_manager.resolve_threads_batch", fail)
+
+        assert resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token") == 0
+
+    def test_counts_only_what_github_confirmed_resolved(self, monkeypatch):
+        """resolve_threads_batch drops IDs GitHub did not confirm; so does the count."""
+        monkeypatch.setattr(
+            "vigil.comment_manager.fetch_review_threads",
+            lambda *args: [
+                _thread("thread-1", "Finding `VGL-abc123`"),
+                _thread("thread-2", "Finding `VGL-def456`"),
+            ],
+        )
+        monkeypatch.setattr(
+            "vigil.comment_manager.resolve_threads_batch",
+            lambda ids, token: ids[:1],
+        )
+
+        assert resolve_vigil_threads_on_approval("F2iLLC", "demo", 1, "token") == 1
+
+
 # ---------- _is_resolution_reply ----------
 
 class TestIsResolutionReply:
@@ -296,6 +514,12 @@ class TestIsResolutionReply:
     def test_resolved_with_issue_link(self):
         assert _is_resolution_reply("Resolved via https://github.com/o/r/issues/10") is True
 
+    def test_overruled_reply(self):
+        assert _is_resolution_reply("Overruled by maintainer; acceptable risk.") is True
+
+    def test_follow_up_reply(self):
+        assert _is_resolution_reply("Tracked for a follow-up PR.") is True
+
     def test_just_number_not_resolution(self):
         assert _is_resolution_reply("42") is False
 
@@ -308,6 +532,11 @@ class TestExtractIssueRefs:
         refs = _extract_issue_refs("See https://github.com/org/repo/issues/123")
         assert len(refs) == 1
         assert refs[0] == ("org", "repo", 123)
+
+    def test_full_pull_url(self):
+        refs = _extract_issue_refs("Follow-up PR: https://github.com/org/repo/pull/456")
+        assert len(refs) == 1
+        assert refs[0] == ("org", "repo", 456)
 
     def test_short_ref(self):
         refs = _extract_issue_refs("Fixed in #45")
@@ -364,6 +593,161 @@ class TestIssueCoversFinding:
         issue = {"title": "Fix bug", "body": "Fix it"}
         finding = ""
         assert _issue_covers_finding(issue, finding) is True  # benefit of doubt
+
+
+# ---------- build_conversation_context ----------
+
+class TestBuildConversationContext:
+
+    def test_empty_inputs_returns_empty_string(self):
+        assert build_conversation_context([], []) == ""
+        assert build_conversation_context([], None) == ""
+
+    def test_includes_comment_author_and_body(self):
+        comments = [{
+            "created_at": "2026-07-15T10:00:00Z",
+            "user": {"login": "codex-bot"},
+            "body": "Your team has set up Codex to review pull requests in this repo.",
+        }]
+        result = build_conversation_context(comments)
+        assert "codex-bot" in result
+        assert "Codex to review pull requests" in result
+
+    def test_skips_blank_body_comments(self):
+        comments = [
+            {"created_at": "2026-07-15T10:00:00Z", "user": {"login": "a"}, "body": "   "},
+            {"created_at": "2026-07-15T10:01:00Z", "user": {"login": "b"}, "body": "real comment"},
+        ]
+        result = build_conversation_context(comments)
+        assert "real comment" in result
+        assert "**a**" not in result
+
+    def test_includes_review_body_with_state(self):
+        reviews = [{
+            "submitted_at": "2026-07-15T11:00:00Z",
+            "user": {"login": "reviewer1"},
+            "state": "APPROVED",
+            "body": "LGTM overall",
+        }]
+        result = build_conversation_context([], reviews)
+        assert "reviewer1" in result
+        assert "review:approved" in result
+        assert "LGTM overall" in result
+
+    def test_excludes_prior_vigil_reviews_from_re_review_context(self):
+        reviews = [{
+            "submitted_at": "2026-07-15T11:00:00Z",
+            "user": {"login": "vigil-reviewer"},
+            "state": "CHANGES_REQUESTED",
+            "body": (
+                "Old finding claims bodyChunks still buffers the response.\n\n"
+                "Reviewed by [Vigil]"
+            ),
+        }]
+
+        assert build_conversation_context([], reviews) == ""
+
+    def test_keeps_human_review_alongside_excluded_vigil_review(self):
+        reviews = [
+            {
+                "submitted_at": "2026-07-15T11:00:00Z",
+                "user": {"login": "vigil-reviewer"},
+                "state": "CHANGES_REQUESTED",
+                "body": "Superseded bot finding\n\nReviewed by [Vigil]",
+            },
+            {
+                "submitted_at": "2026-07-15T12:00:00Z",
+                "user": {"login": "maintainer"},
+                "state": "COMMENTED",
+                "body": "The current implementation still needs a timeout test.",
+            },
+        ]
+
+        result = build_conversation_context([], reviews)
+
+        assert "Superseded bot finding" not in result
+        assert "maintainer" in result
+        assert "timeout test" in result
+
+    def test_excludes_vigils_own_issue_comment_from_the_context(self):
+        """F2iLLC/vigil#74: the same exclusion, on the loop that lacked it.
+
+        When every PR Review API attempt fails, post_review falls back to
+        posting the whole review body — findings text included — as an *issue*
+        comment, and issue comments arrive through the comments loop, not the
+        reviews loop. So Vigil read its own prior CRITICAL findings back in as
+        "PR Conversation" evidence and could re-assert a defect a later commit
+        had already removed.
+        """
+        comments = [{
+            "created_at": "2026-07-15T11:00:00Z",
+            "user": {"login": "vigil-reviewer"},
+            "body": (
+                "## ❌ Vigil Review: **REQUEST_CHANGES**\n\n"
+                "Cannot find namespace JSX in AdminUserList.tsx\n\n"
+                "*Reviewed by [Vigil](https://github.com/F2iProject/vigil)*"
+            ),
+        }]
+
+        assert build_conversation_context(comments) == ""
+
+    def test_keeps_human_comments_alongside_an_excluded_vigil_comment(self):
+        comments = [
+            {
+                "created_at": "2026-07-15T11:00:00Z",
+                "user": {"login": "vigil-reviewer"},
+                "body": "Stale JSX finding\n\nReviewed by [Vigil]",
+            },
+            {
+                "created_at": "2026-07-15T12:00:00Z",
+                "user": {"login": "maintainer"},
+                "body": "CI typecheck passes on this head; that finding is wrong.",
+            },
+        ]
+
+        result = build_conversation_context(comments)
+
+        assert "Stale JSX finding" not in result
+        assert "maintainer" in result
+        assert "CI typecheck passes" in result
+
+    def test_skips_reviews_without_body(self):
+        reviews = [{
+            "submitted_at": "2026-07-15T11:00:00Z",
+            "user": {"login": "reviewer1"},
+            "state": "APPROVED",
+            "body": "",
+        }]
+        assert build_conversation_context([], reviews) == ""
+
+    def test_chronological_ordering(self):
+        comments = [
+            {"created_at": "2026-07-15T12:00:00Z", "user": {"login": "later"}, "body": "second"},
+            {"created_at": "2026-07-15T10:00:00Z", "user": {"login": "earlier"}, "body": "first"},
+        ]
+        result = build_conversation_context(comments)
+        assert result.index("first") < result.index("second")
+
+    def test_truncates_long_item(self):
+        comments = [{
+            "created_at": "2026-07-15T10:00:00Z",
+            "user": {"login": "verbose"},
+            "body": "x" * 2000,
+        }]
+        result = build_conversation_context(comments, max_item_chars=100)
+        assert "truncated" in result
+        assert len(result) < 2000
+
+    def test_drops_oldest_items_when_over_budget(self):
+        comments = [
+            {"created_at": f"2026-07-15T{h:02d}:00:00Z", "user": {"login": f"u{h}"}, "body": "x" * 200}
+            for h in range(10)
+        ]
+        result = build_conversation_context(comments, max_total_chars=500, max_item_chars=200)
+        # Most recent author should survive, oldest should be dropped
+        assert "u9" in result
+        assert "u0" not in result
+        assert "omitted for length" in result
 
 
 # ---------- _parse_finding_from_comment ----------

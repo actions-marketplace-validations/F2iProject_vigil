@@ -10,6 +10,7 @@ from vigil.alerts import (
     _format_findings_text,
     send_alert,
     send_alerts_for_verdicts,
+    send_escalation_webhook,
 )
 from vigil.models import Finding, PersonaVerdict, Severity
 
@@ -145,6 +146,111 @@ class TestSendAlert:
             send_alert("Security", [_make_finding(sev=Severity.critical)])
 
 
+# ---------- send_escalation_webhook ----------
+
+class TestSendEscalationWebhook:
+
+    def test_not_configured_returns_false_no_call(self):
+        env = {"LUNAOS_ESCALATION_URL": "", "ESCALATION_INGEST_TOKEN": ""}
+        with patch.dict(os.environ, env, clear=False):
+            with patch("vigil.alerts.httpx.post") as mock_post:
+                result = send_escalation_webhook(
+                    "Security", [_make_finding()],
+                    pr_url="https://github.com/org/repo/pull/1",
+                )
+        assert result is False
+        mock_post.assert_not_called()
+
+    def test_missing_token_only_returns_false_no_call(self):
+        env = {
+            "LUNAOS_ESCALATION_URL": "https://hetzner-api.lunaos.io/api/escalations",
+            "ESCALATION_INGEST_TOKEN": "",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("vigil.alerts.httpx.post") as mock_post:
+                result = send_escalation_webhook(
+                    "Security", [_make_finding()],
+                    pr_url="https://github.com/org/repo/pull/1",
+                )
+        assert result is False
+        mock_post.assert_not_called()
+
+    def test_malformed_pr_url_returns_false_no_call(self):
+        env = {
+            "LUNAOS_ESCALATION_URL": "https://hetzner-api.lunaos.io/api/escalations",
+            "ESCALATION_INGEST_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("vigil.alerts.httpx.post") as mock_post:
+                result = send_escalation_webhook(
+                    "Security", [_make_finding()],
+                    pr_url="https://example.com/not-a-github-pr",
+                )
+        assert result is False
+        mock_post.assert_not_called()
+
+    @patch("vigil.alerts.httpx.post")
+    def test_posts_with_expected_url_headers_and_payload(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        env = {
+            "LUNAOS_ESCALATION_URL": "https://hetzner-api.lunaos.io/api/escalations",
+            "ESCALATION_INGEST_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = send_escalation_webhook(
+                "Security",
+                [_make_finding()],
+                pr_url="https://github.com/org/repo/pull/42",
+                pr_title="Add auth module",
+            )
+
+        assert result is True
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        assert args[0] == "https://hetzner-api.lunaos.io/api/escalations"
+        assert kwargs["headers"]["X-Escalation-Token"] == "secret-token"
+        assert kwargs["headers"]["Content-Type"] == "application/json"
+        assert kwargs["timeout"] == 10
+
+        payload = kwargs["json"]
+        assert payload["source"] == "vigil"
+        assert payload["repo"] == "org/repo"
+        assert payload["subjectType"] == "pr"
+        assert payload["subjectId"] == "42"
+        assert payload["kind"] == "needs-human-review"
+        assert "Security" in payload["title"]
+        assert payload["deepLink"] == "https://github.com/org/repo/pull/42"
+        assert "SQL injection" in payload["reason"]
+
+    @patch("vigil.alerts.httpx.post")
+    def test_non_2xx_response_returns_false(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=400, text="bad source value")
+        env = {
+            "LUNAOS_ESCALATION_URL": "https://hetzner-api.lunaos.io/api/escalations",
+            "ESCALATION_INGEST_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = send_escalation_webhook(
+                "Security", [_make_finding()],
+                pr_url="https://github.com/org/repo/pull/42",
+            )
+        assert result is False
+
+    @patch("vigil.alerts.httpx.post")
+    def test_request_exception_returns_false_not_raised(self, mock_post):
+        mock_post.side_effect = Exception("connection refused")
+        env = {
+            "LUNAOS_ESCALATION_URL": "https://hetzner-api.lunaos.io/api/escalations",
+            "ESCALATION_INGEST_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = send_escalation_webhook(
+                "Security", [_make_finding()],
+                pr_url="https://github.com/org/repo/pull/42",
+            )
+        assert result is False
+
+
 # ---------- send_alerts_for_verdicts ----------
 
 class TestSendAlertsForVerdicts:
@@ -214,3 +320,54 @@ class TestSendAlertsForVerdicts:
             "Security", [_make_finding()],
             "https://github.com/o/r/pull/1", "My PR",
         )
+
+    def test_both_email_and_webhook_attempted(self):
+        """Both delivery paths (email + escalation webhook) are attempted
+        for each alert-enabled verdict with findings."""
+        verdicts = [
+            PersonaVerdict(
+                persona="Security", decision="APPROVE",
+                checks={}, findings=[], observations=[_make_finding()],
+            ),
+        ]
+        with patch("vigil.alerts.send_alert", return_value=True) as mock_email, \
+             patch("vigil.alerts.send_escalation_webhook", return_value=True) as mock_webhook:
+            sent = send_alerts_for_verdicts(
+                verdicts, {"Security"},
+                pr_url="https://github.com/o/r/pull/1", pr_title="My PR",
+            )
+
+        assert sent == 1
+        mock_email.assert_called_once_with(
+            "Security", [_make_finding()], "https://github.com/o/r/pull/1", "My PR",
+        )
+        mock_webhook.assert_called_once_with(
+            "Security", [_make_finding()], "https://github.com/o/r/pull/1", "My PR",
+        )
+
+    def test_counts_once_when_only_webhook_succeeds(self):
+        """If email fails but the webhook succeeds, it still counts as sent."""
+        verdicts = [
+            PersonaVerdict(
+                persona="Security", decision="APPROVE",
+                checks={}, findings=[], observations=[_make_finding()],
+            ),
+        ]
+        with patch("vigil.alerts.send_alert", return_value=False), \
+             patch("vigil.alerts.send_escalation_webhook", return_value=True):
+            sent = send_alerts_for_verdicts(verdicts, {"Security"})
+
+        assert sent == 1
+
+    def test_counts_zero_when_both_fail(self):
+        verdicts = [
+            PersonaVerdict(
+                persona="Security", decision="APPROVE",
+                checks={}, findings=[], observations=[_make_finding()],
+            ),
+        ]
+        with patch("vigil.alerts.send_alert", return_value=False), \
+             patch("vigil.alerts.send_escalation_webhook", return_value=False):
+            sent = send_alerts_for_verdicts(verdicts, {"Security"})
+
+        assert sent == 0

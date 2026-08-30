@@ -6,14 +6,14 @@ from unittest.mock import patch, MagicMock
 from vigil.issue_manager import (
     _build_issue_body,
     _build_issue_title,
-    _fetch_all_vigil_issues,
+    _fetch_all_issues,
     _match_finding_to_issue,
     _VIGIL_ISSUE_MARKER,
-    _VIGIL_LABEL,
     create_issue,
     create_issues_for_observations,
-    ensure_vigil_label,
+    ensure_priority_label,
     find_existing_issue,
+    priority_label_for,
 )
 from vigil.models import Finding, PersonaVerdict, ReviewResult, Severity
 
@@ -143,29 +143,48 @@ class TestBuildIssueBody:
         assert "Performance" in body
 
 
-# ---------- ensure_vigil_label ----------
+# ---------- ensure_priority_label ----------
 
 class TestEnsureVigilLabel:
 
     @patch("vigil.issue_manager.httpx.post")
     def test_creates_label_successfully(self, mock_post):
         mock_post.return_value = MagicMock(status_code=201)
-        assert ensure_vigil_label("owner", "repo", "token") is True
+        assert ensure_priority_label("owner", "repo", "token", Severity.high) is True
 
     @patch("vigil.issue_manager.httpx.post")
     def test_label_already_exists(self, mock_post):
         mock_post.return_value = MagicMock(status_code=422)
-        assert ensure_vigil_label("owner", "repo", "token") is True
+        assert ensure_priority_label("owner", "repo", "token", Severity.high) is True
 
     @patch("vigil.issue_manager.httpx.post")
     def test_api_error(self, mock_post):
         mock_post.return_value = MagicMock(status_code=403, text="Forbidden")
-        assert ensure_vigil_label("owner", "repo", "token") is False
+        assert ensure_priority_label("owner", "repo", "token", Severity.high) is False
 
     @patch("vigil.issue_manager.httpx.post")
     def test_network_error(self, mock_post):
         mock_post.side_effect = Exception("Connection refused")
-        assert ensure_vigil_label("owner", "repo", "token") is False
+        assert ensure_priority_label("owner", "repo", "token", Severity.high) is False
+
+    @patch("vigil.issue_manager.httpx.post")
+    def test_uses_matching_priority_label(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=201)
+        ensure_priority_label("owner", "repo", "token", Severity.low)
+        assert mock_post.call_args.kwargs["json"]["name"] == "Low Priority"
+
+
+@pytest.mark.parametrize(
+    ("severity", "expected"),
+    [
+        (Severity.critical, "Critical Priority"),
+        (Severity.high, "High Priority"),
+        (Severity.medium, "Medium Priority"),
+        (Severity.low, "Low Priority"),
+    ],
+)
+def test_priority_label_matches_severity(severity, expected):
+    assert priority_label_for(_make_finding(sev=severity)) == expected
 
 
 # ---------- _match_finding_to_issue ----------
@@ -219,7 +238,7 @@ class TestFindExistingIssue:
         url = find_existing_issue("o", "r", "token", f, "Logic", existing_issues=issues)
         assert url is None
 
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
+    @patch("vigil.issue_manager._fetch_all_issues")
     def test_fetches_when_no_prefetched(self, mock_fetch):
         f = _make_finding()
         mock_fetch.return_value = []
@@ -228,7 +247,7 @@ class TestFindExistingIssue:
         mock_fetch.assert_called_once_with("o", "r", "token")
 
 
-# ---------- _fetch_all_vigil_issues (pagination) ----------
+# ---------- _fetch_all_issues (pagination) ----------
 
 class TestFetchAllVigilIssues:
 
@@ -245,8 +264,9 @@ class TestFetchAllVigilIssues:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        issues = _fetch_all_vigil_issues("o", "r", "token")
+        issues = _fetch_all_issues("o", "r", "token")
         assert len(issues) == 2
+        assert mock_client.get.call_args.kwargs["params"] == {"state": "open", "per_page": "100"}
 
     @patch("vigil.issue_manager.httpx.Client")
     def test_pagination_follows_links(self, mock_client_cls):
@@ -268,7 +288,7 @@ class TestFetchAllVigilIssues:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        issues = _fetch_all_vigil_issues("o", "r", "token")
+        issues = _fetch_all_issues("o", "r", "token")
         assert len(issues) == 2
         assert mock_client.get.call_count == 2
 
@@ -280,7 +300,7 @@ class TestFetchAllVigilIssues:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        issues = _fetch_all_vigil_issues("o", "r", "token")
+        issues = _fetch_all_issues("o", "r", "token")
         assert issues == []
 
 
@@ -303,7 +323,7 @@ class TestCreateIssue:
         # Verify the request payload
         call_kwargs = mock_post.call_args
         payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
-        assert _VIGIL_LABEL in payload["labels"]
+        assert payload["labels"] == ["Medium Priority"]
         assert "[Vigil/Security]" in payload["title"]
         assert _VIGIL_ISSUE_MARKER in payload["body"]
 
@@ -325,8 +345,8 @@ class TestCreateIssuesForObservations:
         assert issues == []
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
-    @patch("vigil.issue_manager.ensure_vigil_label")
+    @patch("vigil.issue_manager._fetch_all_issues")
+    @patch("vigil.issue_manager.ensure_priority_label")
     def test_creates_new_issues(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
         mock_fetch.return_value = []  # No existing issues
@@ -341,8 +361,8 @@ class TestCreateIssuesForObservations:
         mock_create.assert_called_once()
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
-    @patch("vigil.issue_manager.ensure_vigil_label")
+    @patch("vigil.issue_manager._fetch_all_issues")
+    @patch("vigil.issue_manager.ensure_priority_label")
     def test_deduplicates_against_existing(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
         mock_fetch.return_value = [
@@ -358,8 +378,8 @@ class TestCreateIssuesForObservations:
         mock_create.assert_not_called()  # Should NOT create a new issue
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
-    @patch("vigil.issue_manager.ensure_vigil_label")
+    @patch("vigil.issue_manager._fetch_all_issues")
+    @patch("vigil.issue_manager.ensure_priority_label")
     def test_uses_observation_sources_for_persona(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
         mock_fetch.return_value = []
@@ -377,8 +397,8 @@ class TestCreateIssuesForObservations:
         assert call_args[1].get("persona") or call_args[0][4] == "Performance"
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
-    @patch("vigil.issue_manager.ensure_vigil_label")
+    @patch("vigil.issue_manager._fetch_all_issues")
+    @patch("vigil.issue_manager.ensure_priority_label")
     def test_handles_create_failure_gracefully(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
         mock_fetch.return_value = []
@@ -391,8 +411,8 @@ class TestCreateIssuesForObservations:
         assert len(issues) == 0  # Failed creation means no issue returned
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
-    @patch("vigil.issue_manager.ensure_vigil_label")
+    @patch("vigil.issue_manager._fetch_all_issues")
+    @patch("vigil.issue_manager.ensure_priority_label")
     def test_multiple_observations(self, mock_label, mock_fetch, mock_create):
         mock_label.return_value = True
         mock_fetch.return_value = []
@@ -417,8 +437,8 @@ class TestCreateIssuesForObservations:
         assert mock_create.call_count == 2
 
     @patch("vigil.issue_manager.create_issue")
-    @patch("vigil.issue_manager._fetch_all_vigil_issues")
-    @patch("vigil.issue_manager.ensure_vigil_label")
+    @patch("vigil.issue_manager._fetch_all_issues")
+    @patch("vigil.issue_manager.ensure_priority_label")
     def test_prefetches_issues_once(self, mock_label, mock_fetch, mock_create):
         """Verify issues are fetched once (not per observation) to avoid N+1."""
         mock_label.return_value = True

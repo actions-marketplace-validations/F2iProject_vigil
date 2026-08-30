@@ -16,9 +16,9 @@ inputs:
     required: false
     default: "review"
   model:
-    description: "LLM model for specialists (litellm format, e.g. gemini/gemini-2.5-flash)"
+    description: "LLM model for specialists (litellm format, e.g. gemini/gemini-3.1-flash-lite)"
     required: false
-    default: "gemini/gemini-2.5-flash"
+    default: "gemini/gemini-3.1-flash-lite"
   lead-model:
     description: "LLM model for lead reviewer (defaults to --model value)"
     required: false
@@ -27,6 +27,42 @@ inputs:
     description: "Review profile: default, enterprise"
     required: false
     default: "default"
+  force:
+    description: "Review even when no files changed since the last review (set for on-demand '/vigil review')"
+    required: false
+    default: "false"
+  reason:
+    description: "Why this review was requested; recorded in the run log"
+    required: false
+    default: ""
+  context-provider:
+    description: >-
+      Optional external review-context provider: either a command to execute
+      or an http(s) endpoint to POST the PR coordinates to. Invoked once per
+      review; its opaque text output is injected into the review prompt as
+      untrusted evidence and is never parsed by Vigil. Absent, empty,
+      failing, or timed-out providers are ignored and the review proceeds.
+      SECURITY: do not pass this (or context-token) on a pull_request event
+      from a fork -- the reusable workflow gates both off when the PR head
+      repository differs from the base repository, and a direct caller of
+      this action must apply the same gate itself.
+    required: false
+    default: ""
+  context-label:
+    description: >-
+      Optional short label naming the external context source, shown to
+      reviewers so they know where the evidence came from. Flattened to one
+      line and truncated; it cannot introduce prompt structure.
+    required: false
+    default: ""
+  context-token:
+    description: >-
+      One opaque operator-supplied token for the external context provider.
+      Exported to a command provider as VIGIL_CONTEXT_TOKEN, or sent to an
+      HTTP provider as the X-Vigil-Context-Token header. Vigil has no
+      credentials for, and no knowledge of, any specific external system.
+    required: false
+    default: ""
   github-token:
     description: "GitHub token for posting reviews (defaults to GITHUB_TOKEN)"
     required: false
@@ -41,26 +77,105 @@ inputs:
     description: "Anthropic API key (required if using claude-* models)"
     required: false
 
+outputs:
+  review-ran:
+    description: >-
+      "true" if the install and Run Vigil steps both completed
+      successfully; "false" if Vigil did not actually run (e.g. the venv
+      install failed) and the requested command was never executed. When
+      "false", a hard ::error:: annotation, a $GITHUB_STEP_SUMMARY entry,
+      and a best-effort PR comment were already emitted by this action
+      regardless of any continue-on-error the caller applies. Callers that
+      want to gate merges on an actual completed review, rather than on
+      this job's advisory-wrapped conclusion, can check this output
+      explicitly.
+    value: ${{ steps.guard.outputs.review-ran }}
+
 runs:
   using: "composite"
   steps:
-    - name: Set up Python
+    # Resolve a usable Python 3.10+ interpreter. Prefer the system python3 on
+    # self-hosted runners (Hetzner ci-general boxes ship with Python 3.12 and
+    # the venv module), and fall back to actions/setup-python on GitHub-hosted
+    # runners where the toolcache is reliable.
+    - name: Detect Python
+      id: py
+      shell: bash
+      run: |
+        if command -v python3 >/dev/null 2>&1; then
+          PY_VERSION="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+          if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+            # A version check alone is not sufficient: Debian/Ubuntu ships
+            # python3 without ensurepip unless python3.X-venv is separately
+            # installed, so `python3 -m venv` can fail even though the
+            # interpreter itself is a perfectly fine 3.10+. Probe that venv
+            # actually works before committing to the system interpreter —
+            # otherwise this guard reports success, "Install Vigil into a
+            # venv" then hard-fails, and (depending on the caller's
+            # continue-on-error setting) the whole run can silently report
+            # green without ever posting a review. Seen for real on
+            # F2iLLC/LunaOS's lunaos-light-1 runner (LunaOS#3775).
+            PROBE_DIR="$(mktemp -d)"
+            if python3 -m venv "$PROBE_DIR/probe" >/dev/null 2>&1; then
+              rm -rf "$PROBE_DIR"
+              echo "Found system python3 $PY_VERSION with a working venv module — skipping setup-python"
+              echo "python=$(command -v python3)" >> "$GITHUB_OUTPUT"
+              echo "needs_setup=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            rm -rf "$PROBE_DIR"
+            echo "System python3 $PY_VERSION found, but 'python3 -m venv' failed (ensurepip missing?) — falling back to setup-python"
+          fi
+        fi
+        echo "No suitable system python3 — will run actions/setup-python"
+        echo "needs_setup=true" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python (fallback)
+      if: steps.py.outputs.needs_setup == 'true'
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
 
-    - name: Install Vigil
+    - name: Install Vigil into a venv
+      id: install
       shell: bash
-      run: pip install "${{ github.action_path }}"
+      run: |
+        set -euo pipefail
+        if [ "${{ steps.py.outputs.needs_setup }}" = "true" ]; then
+          PYTHON_BIN="$(command -v python)"
+        else
+          PYTHON_BIN="${{ steps.py.outputs.python }}"
+        fi
+        VENV_DIR="${RUNNER_TEMP:-/tmp}/vigil-venv-${GITHUB_RUN_ID:-local}"
+        rm -rf "$VENV_DIR"
+        "$PYTHON_BIN" -m venv "$VENV_DIR"
+        "$VENV_DIR/bin/pip" install --upgrade pip
+        "$VENV_DIR/bin/pip" install "${{ github.action_path }}"
+        echo "vigil=$VENV_DIR/bin/vigil" >> "$GITHUB_OUTPUT"
 
     - name: Run Vigil
+      id: run
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        # Passed via env rather than interpolated into the script body: the
+        # reason can carry caller-supplied text, and `${{ }}` inside `run:` is
+        # a shell-injection surface.
+        VIGIL_FORCE: ${{ inputs.force }}
+        VIGIL_REASON: ${{ inputs.reason }}
+        # External review context (F2iLLC/vigil#47). Env only, never
+        # interpolated into the script body: the provider is an
+        # operator-supplied command string and `${{ }}` inside `run:` is a
+        # shell-injection surface. Unset/empty disables the seam entirely.
+        VIGIL_CONTEXT_PROVIDER: ${{ inputs.context-provider }}
+        VIGIL_CONTEXT_LABEL: ${{ inputs.context-label }}
+        VIGIL_CONTEXT_TOKEN: ${{ inputs.context-token }}
       run: |
+        set -euo pipefail
+        VIGIL="${{ steps.install.outputs.vigil }}"
         PR_URL="${{ inputs.pr-url }}"
         if [ -z "$PR_URL" ]; then
           PR_URL="${{ github.event.pull_request.html_url }}"
@@ -69,9 +184,9 @@ runs:
         COMMAND="${{ inputs.command }}"
 
         if [ "$COMMAND" = "dismiss-resolved" ]; then
-          vigil dismiss-resolved "$PR_URL"
+          "$VIGIL" dismiss-resolved "$PR_URL"
         elif [ "$COMMAND" = "resolve-addressed" ]; then
-          vigil resolve-addressed "$PR_URL"
+          "$VIGIL" resolve-addressed "$PR_URL"
         else
           ARGS=(
             "$PR_URL"
@@ -82,5 +197,149 @@ runs:
           if [ -n "${{ inputs.lead-model }}" ]; then
             ARGS+=(--lead-model "${{ inputs.lead-model }}")
           fi
-          vigil review "${ARGS[@]}"
+          # An on-demand '/vigil review' must produce a fresh verdict even when
+          # the head has not moved, otherwise the documented escape hatch is a
+          # no-op on exactly the PRs that need it (F2iLLC/vigil#49).
+          if [ "${VIGIL_FORCE:-false}" = "true" ]; then
+            ARGS+=(--force)
+          fi
+          if [ -n "${VIGIL_REASON:-}" ]; then
+            ARGS+=(--reason "$VIGIL_REASON")
+          fi
+          "$VIGIL" review "${ARGS[@]}"
         fi
+
+    # Runs even when earlier steps failed (if: always()) so a broken
+    # install/run never fails silently. See F2iLLC/vigil#51: on a runner
+    # whose python3 lacks ensurepip, "Install Vigil into a venv" fails,
+    # "Run Vigil" is then skipped, and because callers commonly wrap this
+    # action in continue-on-error (the reusable workflow's advisory input),
+    # the job still concludes success with no review ever posted. This step
+    # makes that failure unmissable without touching merge-gating defaults:
+    # it fails itself (so the run's step list shows red), emits a hard
+    # ::error:: annotation, writes to the job summary, and best-effort
+    # posts a PR comment — all independent of whatever continue-on-error
+    # the caller applied to the steps above.
+    - name: Verify Vigil actually ran
+      id: guard
+      if: always()
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_URL_INPUT: ${{ inputs.pr-url }}
+        EVENT_PR_URL: ${{ github.event.pull_request.html_url }}
+        EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        COMMAND: ${{ inputs.command }}
+        INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        RUN_OUTCOME: ${{ steps.run.outcome }}
+      run: |
+        set -euo pipefail
+
+        review_ran="true"
+        if [ "${INSTALL_OUTCOME:-}" != "success" ] || [ "${RUN_OUTCOME:-}" != "success" ]; then
+          review_ran="false"
+        fi
+
+        echo "review-ran=$review_ran" >> "$GITHUB_OUTPUT"
+
+        if [ "$review_ran" = "true" ]; then
+          exit 0
+        fi
+
+        cmd="${COMMAND:-review}"
+        if [ "$cmd" = "review" ]; then
+          action_desc="post a review"
+          outcome_desc="NO REVIEW WAS POSTED for this PR."
+        else
+          action_desc="run its '$cmd' command"
+          outcome_desc="Vigil's '$cmd' step did NOT run for this PR."
+        fi
+
+        MESSAGE="Vigil could not $action_desc: the composite action did not complete (install step outcome='${INSTALL_OUTCOME:-unknown}', run step outcome='${RUN_OUTCOME:-unknown}'). ${outcome_desc} A green or advisory-passed check here does NOT attest that Vigil ran -- treat this PR as unprocessed by Vigil until the underlying failure is fixed. Commonly caused by a runner python3 that lacks ensurepip/venv support, or a network/install failure; see the 'Install Vigil into a venv' and 'Run Vigil' step logs above for the actual error."
+
+        echo "::error title=Vigil did not run::${MESSAGE}"
+
+        {
+          echo ""
+          echo "### :rotating_light: Vigil did not run"
+          echo ""
+          echo "$MESSAGE"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Best-effort PR comment via a plain REST call. The venv Vigil
+        # normally installs itself into may not exist at all right now --
+        # that is often the failure itself -- so we cannot shell out to the
+        # vigil CLI here.
+        #
+        # The comment is reserved for the `review` command only. The
+        # dangerous condition this guard exists to catch is a FALSE
+        # ATTESTATION that a review happened: a green (or advisory-passed)
+        # check with nobody having actually reviewed the PR. dismiss-resolved
+        # and resolve-addressed never create that false attestation -- they
+        # don't post reviews in any outcome -- and resolve-addressed in
+        # particular runs on every `synchronize` event. Commenting there too
+        # would mean up to one comment per command per push, on every open
+        # PR, for as long as the underlying outage lasts (the real #3775
+        # outage ran ~19 hours). Do not widen this past `review` without
+        # solving that spam problem first.
+        pr_number=""
+        pr_url="${PR_URL_INPUT:-}"
+        if [ -z "$pr_url" ]; then
+          pr_url="${EVENT_PR_URL:-}"
+        fi
+        if [ -n "$pr_url" ]; then
+          pr_number="$(printf '%s' "$pr_url" | grep -oE '[0-9]+$' || true)"
+        fi
+        if [ -z "$pr_number" ]; then
+          pr_number="${EVENT_PR_NUMBER:-}"
+        fi
+
+        COMMENT_MARKER="<!-- vigil-did-not-run -->"
+
+        if [ "$cmd" != "review" ]; then
+          echo "Command is '$cmd', not 'review' -- skipping the PR comment by design (the annotation, job summary, and review-ran output above already fired)."
+        elif [ -z "$pr_number" ]; then
+          echo "No resolvable PR number -- skipping the PR comment to avoid guessing the wrong target."
+        elif [ -z "${GITHUB_TOKEN:-}" ]; then
+          echo "No github-token available -- skipping the PR comment."
+        else
+          # Dedup: skip posting if a comment carrying our marker already
+          # exists. Best-effort only -- a GET that errors, times out, or
+          # returns something we don't recognize must fall through to
+          # posting, never go silent. Bounded to one request (no pagination
+          # walk); on a PR with more than 100 prior comments this can miss
+          # an older marker and repost, which is an acceptable degradation
+          # of a best-effort check.
+          already_commented="false"
+          existing_comments="$(curl --silent --max-time 10 \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO:-}/issues/${pr_number}/comments?per_page=100" \
+            2>/dev/null || true)"
+          if [ -n "$existing_comments" ] && printf '%s' "$existing_comments" | grep -qF "$COMMENT_MARKER"; then
+            already_commented="true"
+          fi
+
+          if [ "$already_commented" = "true" ]; then
+            echo "A 'Vigil did not run' comment already exists on this PR -- skipping to avoid duplicate comments."
+          else
+            comment_body="Vigil did not run on this PR. ${MESSAGE} Do not read this check as a completed review. ${COMMENT_MARKER}"
+            escaped_body="$(printf '%s' "$comment_body" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+            json_payload="{\"body\":\"${escaped_body}\"}"
+
+            if curl --fail --silent --show-error --max-time 10 -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${REPO:-}/issues/${pr_number}/comments" \
+              -d "$json_payload" \
+              -o /dev/null; then
+              echo "Posted a PR comment noting Vigil did not run."
+            else
+              echo "::warning::Best-effort PR comment failed to post. This warning is only about the comment itself -- see the ::error:: annotation and job summary above for the actual Vigil failure."
+            fi
+          fi
+        fi
+
+        exit 1

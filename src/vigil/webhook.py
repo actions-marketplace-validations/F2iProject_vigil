@@ -89,12 +89,22 @@ def _should_dismiss(event: str, payload: dict) -> bool:
     return _is_resolution_reply(body)
 
 
-def _run_review(pr_url: str, model: str, lead_model: Optional[str], profile: str):
+def _run_review(
+    pr_url: str, model: str, lead_model: Optional[str], profile: str,
+    force: bool = False, reason: str = "",
+):
     """Run a Vigil review in a background thread."""
     import subprocess
     cmd = ["vigil", "review", pr_url, "--model", model, "--profile", profile, "--post"]
     if lead_model:
         cmd.extend(["--lead-model", lead_model])
+    # The webhook is the second entry point that serves '/vigil review'. It
+    # must forward the explicit-request signal too, or the escape hatch stays
+    # a no-op on an unchanged head under this deployment (F2iLLC/vigil#49).
+    if force:
+        cmd.append("--force")
+    if reason:
+        cmd.extend(["--reason", reason])
     log.info("Starting review: %s", " ".join(cmd))
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -123,7 +133,7 @@ def _run_dismiss(pr_url: str):
 
 def create_app(
     webhook_secret: Optional[str] = None,
-    model: str = "gemini/gemini-2.5-flash",
+    model: str = "gemini/gemini-3.1-flash-lite",
     lead_model: Optional[str] = None,
     profile: str = "default",
 ) -> FastAPI:
@@ -168,9 +178,13 @@ def create_app(
 
         # Check if we should review
         if _should_review(event, payload):
+            # An issue_comment reaching here matched '/vigil review' in
+            # _should_review, so it is an explicit on-demand request.
+            explicit = event == "issue_comment"
             thread = threading.Thread(
                 target=_run_review,
-                args=(pr_url, model, lead_model, profile),
+                args=(pr_url, model, lead_model, profile, explicit,
+                      "on-demand /vigil review comment" if explicit else ""),
                 daemon=True,
             )
             thread.start()

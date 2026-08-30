@@ -1,7 +1,7 @@
 """GitHub issue creation for non-blocking observations.
 
 Automatically creates GitHub issues for observations and deduplicates
-against existing open issues with the 'vigil' label.
+against all existing open issues using Vigil's body marker.
 """
 
 import difflib
@@ -11,29 +11,40 @@ import re
 import httpx
 
 from .models import Finding, ReviewResult, Severity
+from .context_manager import stable_finding_key
 from .utils import extract_message_content, github_headers, severity_emoji
 
 log = logging.getLogger(__name__)
 
-_VIGIL_LABEL = "vigil"
-_VIGIL_LABEL_COLOR = "6f42c1"
-_VIGIL_LABEL_DESCRIPTION = "Auto-created by Vigil — AI-powered PR review"
+_PRIORITY_LABELS: dict[Severity, tuple[str, str, str]] = {
+    Severity.critical: ("Critical Priority", "b60205", "Requires immediate attention"),
+    Severity.high: ("High Priority", "d93f0b", "Requires prompt attention"),
+    Severity.medium: ("Medium Priority", "fbca04", "Important, but not urgent"),
+    Severity.low: ("Low Priority", "0e8a16", "Useful follow-up when capacity allows"),
+}
 
 # Marker in issue body to identify Vigil-created issues
 _VIGIL_ISSUE_MARKER = "<!-- vigil-observation -->"
+_FINDING_KEY_PATTERN = re.compile(r"<!--\s*vigil-finding-key:\s*([a-f0-9]{24})\s*-->")
 
 
-def ensure_vigil_label(owner: str, repo: str, token: str) -> bool:
-    """Create the 'vigil' label if it doesn't exist. Returns True if created or exists."""
+def priority_label_for(finding: Finding) -> str:
+    """Return the priority label that corresponds to a finding's severity."""
+    return _PRIORITY_LABELS[finding.severity][0]
+
+
+def ensure_priority_label(owner: str, repo: str, token: str, severity: Severity) -> bool:
+    """Create the severity's priority label if needed. Returns True if created or exists."""
+    name, color, description = _PRIORITY_LABELS[severity]
     url = f"https://api.github.com/repos/{owner}/{repo}/labels"
     try:
         resp = httpx.post(
             url,
             headers=github_headers(token),
             json={
-                "name": _VIGIL_LABEL,
-                "color": _VIGIL_LABEL_COLOR,
-                "description": _VIGIL_LABEL_DESCRIPTION,
+                "name": name,
+                "color": color,
+                "description": description,
             },
             timeout=10,
         )
@@ -72,6 +83,7 @@ def _build_issue_body(
 
     sections = [
         _VIGIL_ISSUE_MARKER,
+        f"<!-- vigil-finding-key: {stable_finding_key(finding)} -->",
         f"## {emoji} {finding.severity.value.upper()} — {finding.category}\n",
         f"**File:** `{loc}`",
         f"**Reviewer:** {persona}",
@@ -96,15 +108,15 @@ def _build_issue_body(
     return "\n".join(sections)
 
 
-def _fetch_all_vigil_issues(
+def _fetch_all_issues(
     owner: str, repo: str, token: str,
 ) -> list[dict]:
-    """Fetch all open issues with the 'vigil' label, paginating through all pages.
+    """Fetch all open issues, paginating through all pages.
 
     Returns a list of issue dicts from the GitHub API.
     """
     url: str | None = f"https://api.github.com/repos/{owner}/{repo}/issues"
-    params: dict | None = {"labels": _VIGIL_LABEL, "state": "open", "per_page": "100"}
+    params: dict | None = {"state": "open", "per_page": "100"}
     all_issues: list[dict] = []
 
     try:
@@ -142,12 +154,16 @@ def _match_finding_to_issue(
     finding_text = extract_message_content(finding.message)
     if not finding_text:
         return None
+    finding_key = stable_finding_key(finding)
 
     for issue in issues:
         body = issue.get("body") or ""
         # Must be a Vigil-created issue
         if _VIGIL_ISSUE_MARKER not in body:
             continue
+        key_match = _FINDING_KEY_PATTERN.search(body)
+        if key_match and key_match.group(1) == finding_key:
+            return issue.get("html_url")
         # Check file path match
         if f"`{finding.file}" not in body:
             continue
@@ -174,9 +190,9 @@ def find_existing_issue(
     persona: str,
     existing_issues: list[dict] | None = None,
 ) -> str | None:
-    """Check if an open Vigil issue already exists for this finding.
+    """Check if an open Vigil-created issue already exists for this finding.
 
-    Searches open issues with the 'vigil' label, matches by:
+    Searches all open issues for the Vigil body marker, then matches by:
     1. File path appearing in the body
     2. Message similarity >= 0.85
 
@@ -191,7 +207,7 @@ def find_existing_issue(
     Returns the issue HTML URL if found, None otherwise.
     """
     if existing_issues is None:
-        existing_issues = _fetch_all_vigil_issues(owner, repo, token)
+        existing_issues = _fetch_all_issues(owner, repo, token)
     return _match_finding_to_issue(finding, existing_issues)
 
 
@@ -216,7 +232,7 @@ def create_issue(
             json={
                 "title": title,
                 "body": body,
-                "labels": [_VIGIL_LABEL],
+                "labels": [priority_label_for(finding)],
             },
             timeout=15,
         )
@@ -238,7 +254,7 @@ def create_issues_for_observations(
 ) -> list[tuple[Finding, str]]:
     """Create GitHub issues for all observations in the review result.
 
-    Pre-fetches all existing open Vigil issues once to avoid N+1 API calls,
+    Pre-fetches all existing open issues once to avoid N+1 API calls,
     then deduplicates each observation against the cache before creating.
     Groups observations with their source persona from specialist verdicts.
 
@@ -254,11 +270,12 @@ def create_issues_for_observations(
     if not result.observations:
         return []
 
-    # Ensure the vigil label exists
-    ensure_vigil_label(owner, repo, token)
+    # Ensure every priority label that will be used exists before creating issues.
+    for severity in {obs.severity for obs in result.observations}:
+        ensure_priority_label(owner, repo, token, severity)
 
-    # Pre-fetch all open Vigil issues once (avoids N+1 API calls)
-    existing_issues = _fetch_all_vigil_issues(owner, repo, token)
+    # Pre-fetch all open issues once (avoids N+1 API calls)
+    existing_issues = _fetch_all_issues(owner, repo, token)
 
     # Build persona lookup from observation_sources if available
     persona_map: dict[int, str] = {}
@@ -273,14 +290,21 @@ def create_issues_for_observations(
                 persona_map[id(obs)] = v.persona
 
     issues: list[tuple[Finding, str]] = []
+    created_by_key: dict[str, str] = {}
     for obs in result.observations:
         persona = persona_map.get(id(obs), "Vigil")
+        finding_key = stable_finding_key(obs)
+
+        if finding_key in created_by_key:
+            issues.append((obs, created_by_key[finding_key]))
+            continue
 
         # Check for existing issue using pre-fetched cache
         existing_url = _match_finding_to_issue(obs, existing_issues)
         if existing_url:
             log.info("Observation already tracked: %s", existing_url)
             issues.append((obs, existing_url))
+            created_by_key[finding_key] = existing_url
             continue
 
         # Create new issue
@@ -291,5 +315,6 @@ def create_issues_for_observations(
         )
         if issue_url:
             issues.append((obs, issue_url))
+            created_by_key[finding_key] = issue_url
 
     return issues

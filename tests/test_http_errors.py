@@ -19,10 +19,14 @@ from vigil.comment_manager import (
     resolve_threads_batch,
 )
 from vigil.github import (
+    commit_is_readable,
     get_diff_between_commits,
     get_changed_files_between_commits,
+    get_file_content_at_commit,
     get_pr_data,
+    is_ancestor_commit,
     parse_pr_url,
+    shas_equal,
 )
 
 
@@ -338,6 +342,181 @@ class TestGetChangedFilesBetweenCommits:
 
         with pytest.raises(httpx.HTTPStatusError):
             get_changed_files_between_commits("o", "r", "gone", "head", "token")
+
+
+# ---------- get_file_content_at_commit (F2iLLC/vigil#74) ----------
+
+class TestGetFileContentAtCommit:
+    """404 is the ONLY status this translates into a value.
+
+    That is the whole contract: the head-content guard treats None as "the
+    file is genuinely not in this tree" and suppresses a finding on it, so
+    every other failure has to raise and be kept as "unverified" instead.
+    """
+
+    @patch("vigil.github.httpx.Client")
+    def test_returns_raw_text(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(text='import type { JSX } from "react";')
+
+        result = get_file_content_at_commit("o", "r", "src/a.tsx", "sha", "token")
+        assert "JSX" in result
+        assert client.get.call_args.kwargs["params"] == {"ref": "sha"}
+        assert client.get.call_args.kwargs["headers"]["Accept"].endswith("raw")
+
+    @patch("vigil.github.httpx.Client")
+    def test_404_means_absent_not_an_error(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(status_code=404)
+
+        assert get_file_content_at_commit("o", "r", "gone.py", "sha", "token") is None
+
+    @pytest.mark.parametrize("status", [401, 403, 429, 500])
+    @patch("vigil.github.httpx.Client")
+    def test_every_other_status_raises(self, mock_client_cls, status):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(status_code=status)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            get_file_content_at_commit("o", "r", "a.py", "sha", "token")
+
+    @patch("vigil.github.httpx.Client")
+    def test_timeout_raises(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.side_effect = httpx.TimeoutException("timed out")
+
+        with pytest.raises(httpx.TimeoutException):
+            get_file_content_at_commit("o", "r", "a.py", "sha", "token")
+
+    @patch("vigil.github.httpx.Client")
+    def test_path_is_url_encoded_but_keeps_its_separators(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(text="x")
+
+        get_file_content_at_commit("o", "r", "src/a b/c#d.py", "sha", "token")
+
+        url = client.get.call_args.args[0]
+        assert url.endswith("/contents/src/a%20b/c%23d.py")
+
+
+# ---------- commit_is_readable (F2iLLC/vigil#74) ----------
+
+class TestCommitIsReadable:
+
+    @patch("vigil.github.httpx.Client")
+    def test_readable_commit(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(json_data={"sha": "abc"})
+
+        assert commit_is_readable("o", "r", "abc", "token") is True
+
+    @patch("vigil.github.httpx.Client")
+    def test_404_is_not_readable(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(status_code=404)
+
+        assert commit_is_readable("o", "r", "abc", "token") is False
+
+    @patch("vigil.github.httpx.Client")
+    def test_403_raises_rather_than_reporting_unreadable(self, mock_client_cls):
+        """A rate-limited probe is an unknown, not a "no" — the caller's
+        fail-open handling depends on being able to tell them apart."""
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(status_code=403)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            commit_is_readable("o", "r", "abc", "token")
+
+
+# ---------- is_ancestor_commit (F2iLLC/vigil#74) ----------
+
+class TestIsAncestorCommit:
+
+    def _compare(self, mock_client_cls, payload):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(json_data=payload)
+        return client
+
+    @patch("vigil.github.httpx.Client")
+    def test_ordinary_push_is_an_ancestor(self, mock_client_cls):
+        self._compare(mock_client_cls, {
+            "status": "ahead",
+            "merge_base_commit": {"sha": "old_sha_1234567"},
+        })
+        assert is_ancestor_commit("o", "r", "old_sha_1234567", "head", "token") is True
+
+    @patch("vigil.github.httpx.Client")
+    def test_diverged_status_is_not_an_ancestor(self, mock_client_cls):
+        self._compare(mock_client_cls, {
+            "status": "diverged",
+            "merge_base_commit": {"sha": "old_sha_1234567"},
+        })
+        assert is_ancestor_commit("o", "r", "old_sha_1234567", "head", "token") is False
+
+    @patch("vigil.github.httpx.Client")
+    def test_a_rebase_reports_ahead_from_a_different_merge_base(self, mock_client_cls):
+        """The reported shape: no 404, no "diverged", just a merge base that
+        is no longer the commit we asked about."""
+        self._compare(mock_client_cls, {
+            "status": "ahead",
+            "merge_base_commit": {"sha": "base_of_the_pr_00"},
+        })
+        assert is_ancestor_commit("o", "r", "old_sha_1234567", "head", "token") is False
+
+    @patch("vigil.github.httpx.Client")
+    def test_missing_fields_are_not_an_ancestor(self, mock_client_cls):
+        self._compare(mock_client_cls, {})
+        assert is_ancestor_commit("o", "r", "old_sha_1234567", "head", "token") is False
+
+    @patch("vigil.github.httpx.Client")
+    def test_404_raises_for_the_caller_to_degrade(self, mock_client_cls):
+        client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        client.get.return_value = _mock_response(status_code=404)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            is_ancestor_commit("o", "r", "gone", "head", "token")
+
+
+class TestShasEqual:
+
+    def test_identical_full_shas(self):
+        assert shas_equal("a" * 40, "a" * 40) is True
+
+    def test_abbreviated_prefix_matches(self):
+        assert shas_equal("abc1234", "abc1234" + "f" * 33) is True
+
+    def test_too_short_to_trust(self):
+        assert shas_equal("abc12", "abc12" + "f" * 35) is False
+
+    def test_case_and_whitespace_insensitive(self):
+        assert shas_equal(" ABC1234 ", "abc1234" + "f" * 33) is True
+
+    def test_different_shas(self):
+        assert shas_equal("a" * 40, "b" * 40) is False
+
+    def test_empty_is_never_equal(self):
+        assert shas_equal("", "") is False
+        assert shas_equal("", "a" * 40) is False
 
 
 # ---------- fetch_vigil_reviews ----------

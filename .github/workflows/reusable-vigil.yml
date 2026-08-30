@@ -1,0 +1,366 @@
+name: Reusable Vigil PR Review
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: LLM model for specialists
+        required: false
+        type: string
+        default: gemini/gemini-3.1-flash-lite
+      lead-model:
+        description: Optional separate model for the lead reviewer
+        required: false
+        type: string
+        default: ""
+      profile:
+        description: Review profile
+        required: false
+        type: string
+        default: default
+      runner-json:
+        description: JSON array passed to runs-on
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      # Advisory mode (default true) is what keeps a Vigil infrastructure
+      # hiccup -- a missing provider key, a broken venv/install, a
+      # transient GitHub API error -- from blocking a merge: the `review`,
+      # `dismiss`, and `resolve-addressed` jobs below all wrap the
+      # `F2iLLC/vigil@...` step in `continue-on-error: ${{ inputs.advisory }}`,
+      # so the job still reports success even on a run where Vigil never
+      # executed. It does NOT protect against, and has no effect on, a
+      # completed-but-wrong review verdict -- Vigil's own
+      # APPROVE/REQUEST_CHANGES/BLOCK decision is unrelated to this flag
+      # either way. When Vigil fails to run at all, the composite action's
+      # own "Verify Vigil actually ran" guard step (action.yml) still fails
+      # loudly regardless of this setting: a hard ::error:: annotation, a
+      # job-summary entry, a best-effort PR comment, and a `review-ran:
+      # false` output are all emitted even though advisory=true keeps that
+      # failure non-blocking for merge gating. Flipping this default to
+      # false turns every Vigil infrastructure outage into a merge blocker
+      # fleet-wide (every F2iLLC repo calls this same workflow) -- that is a
+      # deliberate operator policy decision, not a per-repo or per-PR one.
+      advisory:
+        description: Keep provider or review failures advisory
+        required: false
+        type: boolean
+        default: true
+      # External review context (F2iLLC/vigil#47). Opt-in and off by
+      # default. See the "Resolve external context provider" step below for
+      # the fork gate that governs when these actually reach Vigil.
+      context-provider:
+        description: >-
+          Optional external review-context provider: a command to execute or
+          an http(s) endpoint. Its opaque output is injected into the review
+          prompt as untrusted evidence. Gated off on fork pull requests.
+        required: false
+        type: string
+        default: ""
+      context-label:
+        description: Optional short label naming the external context source
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      VIGIL_REVIEW_TOKEN:
+        required: false
+      VIGIL_CONTEXT_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 20
+    concurrency:
+      group: vigil-review-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    if: >-
+      vars.SKIP_VIGIL != 'true' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-vigil') &&
+      !contains(github.event.issue.labels.*.name, 'skip-vigil') &&
+      !contains(github.event.pull_request.title || github.event.issue.title || '', '[skip vigil]') &&
+      (
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.draft == false &&
+          github.actor != 'dependabot[bot]'
+        ) || (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request &&
+          contains(github.event.comment.body, '/vigil review')
+        )
+      )
+    steps:
+      - name: Determine PR URL
+        id: pr
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            # Reaching this job on an issue_comment means the job-level `if:`
+            # already matched '/vigil review', so this is an explicit on-demand
+            # request. Forward that as --force: without it the run short-circuits
+            # on an unchanged head and posts nothing (F2iLLC/vigil#49).
+            echo "url=${{ github.event.issue.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+            echo "force=true" >> "$GITHUB_OUTPUT"
+            echo "reason=on-demand /vigil review comment" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=${{ github.event.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+            echo "force=false" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check review provider key
+        id: provider
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+          LEAD_MODEL: ${{ inputs.lead-model }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          missing=()
+
+          check_model_key() {
+            local selected_model="$1"
+            case "$selected_model" in
+              gemini/*)
+                [ -n "$GEMINI_API_KEY" ] || missing+=("GEMINI_API_KEY")
+                ;;
+              claude-*|anthropic/*)
+                [ -n "$ANTHROPIC_API_KEY" ] || missing+=("ANTHROPIC_API_KEY")
+                ;;
+              gpt-*|o[0-9]-*|openai/*)
+                [ -n "$OPENAI_API_KEY" ] || missing+=("OPENAI_API_KEY")
+                ;;
+            esac
+          }
+
+          check_model_key "$MODEL"
+          if [ -n "$LEAD_MODEL" ] && [ "$LEAD_MODEL" != "$MODEL" ]; then
+            check_model_key "$LEAD_MODEL"
+          fi
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            printf -v missing_list '%s, ' "${missing[@]}"
+            echo "::warning::Skipping Vigil review: ${missing_list%, } is not configured for the selected model(s)."
+          fi
+
+      - name: Check approval credential
+        if: steps.provider.outputs.has_key == 'true'
+        shell: bash
+        env:
+          VIGIL_REVIEW_TOKEN: ${{ secrets.VIGIL_REVIEW_TOKEN }}
+        run: |
+          if [ -z "$VIGIL_REVIEW_TOKEN" ]; then
+            echo "::warning::VIGIL_REVIEW_TOKEN is not configured. GitHub may reject APPROVE/REQUEST_CHANGES and Vigil will fall back to a COMMENT review."
+          fi
+
+      # --- Fork gate for the external context provider (F2iLLC/vigil#47) ---
+      #
+      # The provider is an arbitrary operator-configured command or endpoint
+      # and may carry VIGIL_CONTEXT_TOKEN. Neither may be reachable from a
+      # pull request opened from a fork: the head branch is untrusted code
+      # and untrusted authors, and a fork PR must not be able to steer what
+      # Vigil executes or reach an internal endpoint with an operator
+      # credential attached. Nothing else in this workflow is fork-aware, so
+      # this gate is deliberately narrow -- it changes what the provider
+      # inputs resolve to, and nothing else about whether a review runs.
+      #
+      # This is enforced here rather than only in documentation, and it is
+      # positive logic (allow only on a proven same-repo head), so every case
+      # this step cannot positively prove fails CLOSED:
+      #
+      #   * no provider configured                  -> off (ordinary default)
+      #   * event is not `pull_request`             -> off. An on-demand
+      #     `/vigil review` arrives as `issue_comment`, whose payload does
+      #     NOT carry the PR's head repository, so a fork PR is
+      #     indistinguishable from a same-repo one without an extra API
+      #     call. On-demand reviews therefore run without external context.
+      #   * head repository missing (deleted fork)  -> off
+      #   * head repository != this repository      -> off (the fork case)
+      #
+      # Note the ordering constraint that makes this safe: GitHub does not
+      # expose repository secrets to `pull_request` runs from forks at all,
+      # so VIGIL_CONTEXT_TOKEN would already be empty there. This gate is the
+      # belt to that suspenders, and it is what keeps the *provider target*
+      # (a command Vigil will execute) off fork PRs even when a caller passes
+      # it as a plain workflow input rather than a secret.
+      - name: Resolve external context provider (fork-gated)
+        id: context
+        shell: bash
+        env:
+          PROVIDER: ${{ inputs.context-provider }}
+          LABEL: ${{ inputs.context-label }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          allowed="false"
+          if [ -z "${PROVIDER:-}" ]; then
+            reason="no external context provider configured"
+          elif [ "${EVENT_NAME:-}" != "pull_request" ]; then
+            reason="event '${EVENT_NAME:-unknown}' does not carry head-repository provenance"
+          elif [ -z "${HEAD_REPO:-}" ]; then
+            reason="the pull request head repository is unknown (deleted fork?)"
+          elif [ "${HEAD_REPO}" != "${BASE_REPO:-}" ]; then
+            reason="head repository '${HEAD_REPO}' is a fork of '${BASE_REPO:-unknown}'"
+          else
+            allowed="true"
+            reason="head repository matches '${BASE_REPO}'"
+          fi
+
+          echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+          if [ "$allowed" = "true" ]; then
+            echo "External context provider enabled: $reason"
+            {
+              echo "provider<<VIGIL_EOF"
+              echo "$PROVIDER"
+              echo "VIGIL_EOF"
+              echo "label<<VIGIL_EOF"
+              echo "${LABEL:-}"
+              echo "VIGIL_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "External context provider disabled: $reason"
+            if [ -n "${PROVIDER:-}" ]; then
+              echo "::notice::Vigil is reviewing without external context: $reason"
+            fi
+            {
+              echo "provider="
+              echo "label="
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pin the composite action independently from this reusable workflow.
+      # Update this one reference when a reviewed Vigil implementation lands.
+      #
+      # NOTE: the `force` and `reason` inputs below were added alongside
+      # F2iLLC/vigil#49, and `context-provider` / `context-label` /
+      # `context-token` alongside F2iLLC/vigil#47; none of them exist at the
+      # pinned SHA. GitHub treats unknown composite-action inputs as a
+      # warning, not an error, so this is safe — but the on-demand
+      # '/vigil review' fix and the external context seam both stay INERT
+      # until this pin is advanced to a commit that contains them. The fork
+      # gate above still evaluates either way, so advancing the pin cannot
+      # quietly expose a provider to a fork PR.
+      - uses: F2iLLC/vigil@ce4df1c9c7cf6dc126fe1f04a4cc02c581e8823e
+        if: steps.provider.outputs.has_key == 'true'
+        continue-on-error: ${{ inputs.advisory }}
+        with:
+          pr-url: ${{ steps.pr.outputs.url }}
+          force: ${{ steps.pr.outputs.force }}
+          reason: ${{ steps.pr.outputs.reason }}
+          model: ${{ inputs.model }}
+          lead-model: ${{ inputs.lead-model }}
+          profile: ${{ inputs.profile }}
+          # All three resolve to empty unless the fork gate above allowed
+          # them, so a fork PR can never reach the provider or its token.
+          context-provider: ${{ steps.context.outputs.provider }}
+          context-label: ${{ steps.context.outputs.label }}
+          context-token: ${{ steps.context.outputs.allowed == 'true' && secrets.VIGIL_CONTEXT_TOKEN || '' }}
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ secrets.VIGIL_REVIEW_TOKEN || github.token }}
+
+  dismiss:
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 10
+    if: >-
+      (
+        github.event_name == 'pull_request_review_comment' &&
+        (
+          contains(github.event.comment.body, 'resolved') ||
+          contains(github.event.comment.body, 'Resolved') ||
+          contains(github.event.comment.body, 'fixed') ||
+          contains(github.event.comment.body, 'Fixed') ||
+          contains(github.event.comment.body, 'addressed') ||
+          contains(github.event.comment.body, 'Addressed') ||
+          contains(github.event.comment.body, 'done') ||
+          contains(github.event.comment.body, 'Done') ||
+          contains(github.event.comment.body, 'overruled') ||
+          contains(github.event.comment.body, 'Overruled') ||
+          contains(github.event.comment.body, 'over ruled') ||
+          contains(github.event.comment.body, 'Over ruled') ||
+          contains(github.event.comment.body, 'wontfix') ||
+          contains(github.event.comment.body, 'acceptable') ||
+          contains(github.event.comment.body, 'follow-up') ||
+          contains(github.event.comment.body, 'follow up') ||
+          contains(github.event.comment.body, 'tracked') ||
+          contains(github.event.comment.body, '#') ||
+          contains(github.event.comment.body, '/issues/') ||
+          contains(github.event.comment.body, '/pull/')
+        )
+      ) || (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        !contains(github.event.comment.body, '/vigil review') &&
+        (
+          contains(github.event.comment.body, 'resolved') ||
+          contains(github.event.comment.body, 'Resolved') ||
+          contains(github.event.comment.body, 'fixed') ||
+          contains(github.event.comment.body, 'Fixed') ||
+          contains(github.event.comment.body, 'addressed') ||
+          contains(github.event.comment.body, 'Addressed') ||
+          contains(github.event.comment.body, 'done') ||
+          contains(github.event.comment.body, 'Done') ||
+          contains(github.event.comment.body, 'overruled') ||
+          contains(github.event.comment.body, 'Overruled') ||
+          contains(github.event.comment.body, 'over ruled') ||
+          contains(github.event.comment.body, 'Over ruled') ||
+          contains(github.event.comment.body, 'wontfix') ||
+          contains(github.event.comment.body, 'acceptable') ||
+          contains(github.event.comment.body, 'follow-up') ||
+          contains(github.event.comment.body, 'follow up') ||
+          contains(github.event.comment.body, 'tracked') ||
+          contains(github.event.comment.body, '#') ||
+          contains(github.event.comment.body, '/issues/') ||
+          contains(github.event.comment.body, '/pull/')
+        )
+      )
+    steps:
+      - name: Determine PR URL
+        id: pr
+        shell: bash
+        run: |
+          echo "url=${{ github.event.pull_request.html_url || github.event.issue.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+
+      - uses: F2iLLC/vigil@ce4df1c9c7cf6dc126fe1f04a4cc02c581e8823e
+        continue-on-error: ${{ inputs.advisory }}
+        with:
+          pr-url: ${{ steps.pr.outputs.url }}
+          command: dismiss-resolved
+
+  resolve-addressed:
+    runs-on: ${{ fromJSON(inputs.runner-json) }}
+    timeout-minutes: 10
+    if: >-
+      vars.SKIP_VIGIL != 'true' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-vigil') &&
+      !contains(github.event.pull_request.title || '', '[skip vigil]') &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.draft == false
+    steps:
+      - uses: F2iLLC/vigil@ce4df1c9c7cf6dc126fe1f04a4cc02c581e8823e
+        continue-on-error: ${{ inputs.advisory }}
+        with:
+          command: resolve-addressed

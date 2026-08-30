@@ -4,7 +4,8 @@ Vigil tracks findings across multiple review rounds by generating fingerprints
 for each finding. Before posting new findings, we check against all existing
 Vigil comments (including resolved threads) to avoid re-flagging the same issues.
 
-Finding fingerprint = hash(file + line_range + category + normalized_message)
+New structured findings use a stable component + predicate key. Legacy
+comments retain the location-sensitive fingerprint as a compatibility fallback.
 This enables finding matching even when:
 - The exact line number shifts slightly (same logical location)
 - The message is paraphrased but conveys the same concern
@@ -16,6 +17,7 @@ import hashlib
 import json
 import logging
 import re
+from pathlib import PurePosixPath
 from typing import NamedTuple
 
 from .models import Finding
@@ -26,6 +28,73 @@ log = logging.getLogger(__name__)
 # Pre-compiled regex for extracting JSON metadata from Vigil HTML comments.
 # Uses non-greedy .*? to handle nested objects and values containing '}'.
 _VIGIL_META_PATTERN = re.compile(r"<!--\s*vigil-meta:\s*(\{.*?\})\s*-->")
+_DIAGNOSTIC_CODE = re.compile(r"\b(?:TS|CS|E|ERR_)[-_]?\d{3,}\b", re.IGNORECASE)
+_PATH_IN_TEXT = re.compile(
+    r"(?:packages|apps|services|src|lib)/[A-Za-z0-9_.@/-]+",
+    re.IGNORECASE,
+)
+_IDENTITY_WORDS = re.compile(r"[a-z0-9_:@./-]+")
+_IDENTITY_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "at", "be", "because", "by", "cannot", "could",
+    "does", "fails", "failure", "for", "from", "has", "in", "is", "it", "may",
+    "not", "of", "on", "or", "should", "that", "the", "this", "to", "when",
+    "with", "without", "will", "would",
+})
+
+
+def _canonical_component(finding: Finding) -> str:
+    """Return a stable affected component without trusting the comment anchor.
+
+    The explicit component emitted by current reviewers wins.  Older comments
+    fall back to a package/service path mentioned in their prose, then to the
+    cited file itself.  This is intentionally separate from ``finding.file``:
+    an inline anchor is presentation metadata and historically changed when
+    Vigil relocated an unplaceable finding.
+    """
+    if finding.component.strip():
+        return finding.component.strip().replace("\\", "/").strip("/").lower()
+    mentioned = _PATH_IN_TEXT.search(
+        " ".join((finding.message or "", finding.suggestion or ""))
+    )
+    if mentioned:
+        path = mentioned.group(0).replace("\\", "/").rstrip(".,:;`)]}")
+        parts = PurePosixPath(path).parts
+        return "/".join(parts[:2] if len(parts) > 1 else parts).lower()
+    path = finding.file.replace("\\", "/").strip("/")
+    # With no structured component, the file itself is the only defensible
+    # identity boundary.  Using its parent would collapse unrelated concerns
+    # in two sibling files.
+    return path.lower()
+
+
+def _canonical_predicate(finding: Finding) -> str:
+    """Normalize the defect predicate, preferring structured model output.
+
+    Compiler/runtime diagnostic codes are strong semantic identifiers and are
+    deliberately category-independent.  The lexical fallback retains enough
+    content to keep unrelated findings distinct; it is only a compatibility
+    path for comments created before structured predicate output existed.
+    """
+    supplied = finding.predicate.strip().lower()
+    if supplied:
+        words = _IDENTITY_WORDS.findall(supplied)
+        return " ".join(word for word in words if word not in _IDENTITY_STOPWORDS)
+    text = " ".join((finding.message or "", finding.suggestion or "")).lower()
+    diagnostics = sorted(set(code.upper().replace("-", "_") for code in _DIAGNOSTIC_CODE.findall(text)))
+    if diagnostics:
+        return "diagnostic:" + ",".join(diagnostics)
+    words = _IDENTITY_WORDS.findall(extract_message_content(finding.message).lower())
+    meaningful = sorted(set(word for word in words if word not in _IDENTITY_STOPWORDS))
+    # Legacy unstructured findings have no trustworthy semantic predicate.
+    # Retain category in that fallback so two unrelated generic concerns with
+    # identical short prose are not collapsed merely because they share a file.
+    return f"category:{finding.category.strip().lower()} " + " ".join(meaningful)
+
+
+def stable_finding_key(finding: Finding) -> str:
+    """Durable semantic identity shared by reviews, comments, and issues."""
+    basis = f"{_canonical_component(finding)}\n{_canonical_predicate(finding)}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
 
 class FindingFingerprint(NamedTuple):
@@ -229,6 +298,10 @@ def _extract_finding_from_json_metadata(
             category=category,
             message=message,
             suggestion=metadata.get("suggestion"),
+            component=metadata.get("component", ""),
+            predicate=metadata.get("predicate", ""),
+            evidence_source=metadata.get("evidence_source", "unknown"),
+            evidence_commit=metadata.get("evidence_commit", ""),
         )
     except (json.JSONDecodeError, TypeError, ValueError) as e:
         log.debug("Failed to parse JSON metadata: %s", e)
@@ -402,6 +475,12 @@ def filter_cross_round_duplicates(
     if not existing_comments:
         return list(new_findings)
 
+    # Prefer the semantic identity.  This is independent of specialist label,
+    # category, line movement, and comment relocation.  The legacy fingerprint
+    # index below remains as a compatibility fallback for old unstructured
+    # comments whose wording does not expose a stable predicate.
+    existing_semantic_keys: set[str] = set()
+
     # Pre-build set of existing fingerprints for O(1) lookup
     # Group by file+category for faster initial filtering
     existing_fingerprints_by_file_cat: dict[tuple[str, str], list[FindingFingerprint]] = {}
@@ -413,6 +492,7 @@ def filter_cross_round_duplicates(
             comment.get("line") or comment.get("original_line"),
         )
         if existing_finding:
+            existing_semantic_keys.add(stable_finding_key(existing_finding))
             fp = fingerprint_finding(existing_finding)
             key = (fp.file, fp.category)
             if key not in existing_fingerprints_by_file_cat:
@@ -428,6 +508,12 @@ def filter_cross_round_duplicates(
     # Filter: keep only findings that don't match existing ones
     result = []
     for new_finding in new_findings:
+        if stable_finding_key(new_finding) in existing_semantic_keys:
+            log.debug(
+                "Skipping semantic cross-round duplicate: %s:%s [%s]",
+                new_finding.file, new_finding.line, new_finding.category,
+            )
+            continue
         new_fp = fingerprint_finding(new_finding)
         key = (new_fp.file, new_fp.category)
 
@@ -494,8 +580,8 @@ def build_finding_fingerprint_map(
 
 def find_cross_specialist_duplicates(
     specialist_findings: list[tuple[str, Finding]],
-) -> dict[FindingFingerprint, list[tuple[str, Finding]]]:
-    """Group findings by fingerprint to identify cross-specialist duplicates.
+) -> dict[str, list[tuple[str, Finding]]]:
+    """Group findings by stable semantic identity across specialists.
 
     When multiple specialists flag the same issue at the same location,
     this groups them together so they can be merged into a single comment.
@@ -505,14 +591,14 @@ def find_cross_specialist_duplicates(
                             a single review round
 
     Returns:
-        dict mapping each fingerprint to list of (specialist, finding) that
-        share that fingerprint. Entries with >1 finding are cross-specialist
+        dict mapping each stable key to list of (specialist, finding) that
+        share that identity. Entries with >1 finding are cross-specialist
         duplicates.
     """
-    groups: dict[FindingFingerprint, list[tuple[str, Finding]]] = {}
+    groups: dict[str, list[tuple[str, Finding]]] = {}
     for specialist, finding in specialist_findings:
-        fp = fingerprint_finding(finding)
-        if fp not in groups:
-            groups[fp] = []
-        groups[fp].append((specialist, finding))
+        key = stable_finding_key(finding)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append((specialist, finding))
     return groups

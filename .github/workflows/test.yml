@@ -1,0 +1,37 @@
+# Runs the test suite on every PR. Added per issue #69: this repo shipped
+# 657+ tests that only ever ran on someone's laptop — `Vigil PR Review`
+# (the workflow that would have gated merges via Vigil's own review) has
+# been disabled since March, and re-enabling it means Vigil reviewing PRs
+# about itself, which is deliberately out of scope here. This workflow is
+# the "no downside, no decision attached" half of #69's asks: an
+# independent, hermetic check that requires no LLM calls and no self-review.
+
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vigil-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ${{ fromJSON(vars.VIGIL_RUNNER_JSON || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        run: pytest -q

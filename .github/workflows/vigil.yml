@@ -1,16 +1,6 @@
-# Drop this file into any repo at .github/workflows/vigil.yml
-# to auto-review PRs with Vigil.
-#
-# Required secrets:
-#   GEMINI_API_KEY  — if using gemini/* models (default)
-#   ANTHROPIC_API_KEY — if using claude-* models
-#   OPENAI_API_KEY — if using openai/* models
-#
-# The built-in GITHUB_TOKEN is used for posting reviews.
-# Since it's a bot account, it CAN approve/request_changes (not your own PR).
-#
-# Trigger: reviews on PR open/reopen/ready. Re-review via `/vigil review` comment.
-# Does NOT auto-review on every commit push.
+# This repository's caller for the centrally maintained Vigil workflow.
+# Other F2iLLC repositories can use the same stub with:
+#   uses: F2iLLC/vigil/.github/workflows/reusable-vigil.yml@main
 
 name: Vigil PR Review
 
@@ -25,89 +15,11 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
-  review:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: vigil-review-${{ github.event.pull_request.number || github.event.issue.number }}
-      cancel-in-progress: true
-    # PR events: skip drafts and bot PRs
-    # Comment events: must be on a PR and contain /vigil review
-    if: >-
-      (
-        github.event_name == 'pull_request' &&
-        github.event.pull_request.draft == false &&
-        github.actor != 'dependabot[bot]'
-      ) || (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        contains(github.event.comment.body, '/vigil review')
-      )
-    steps:
-      - name: Determine PR URL
-        id: pr
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            echo "url=${{ github.event.issue.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "url=${{ github.event.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: F2iProject/vigil@v1
-        with:
-          pr-url: ${{ steps.pr.outputs.url }}
-          model: "gemini/gemini-2.5-flash"
-          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
-
-  dismiss:
-    runs-on: ubuntu-latest
-    # Resolve Vigil threads when someone replies "resolved" to an inline comment
-    # or posts "resolved" in the PR conversation
-    if: >-
-      (
-        github.event_name == 'pull_request_review_comment' &&
-        (
-          contains(github.event.comment.body, 'resolved') ||
-          contains(github.event.comment.body, 'Resolved') ||
-          contains(github.event.comment.body, 'fixed') ||
-          contains(github.event.comment.body, 'Fixed') ||
-          contains(github.event.comment.body, 'addressed') ||
-          contains(github.event.comment.body, 'Addressed') ||
-          contains(github.event.comment.body, 'done') ||
-          contains(github.event.comment.body, 'Done')
-        )
-      ) || (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        !contains(github.event.comment.body, '/vigil review') &&
-        (
-          contains(github.event.comment.body, 'resolved') ||
-          contains(github.event.comment.body, 'Resolved')
-        )
-      )
-    steps:
-      - name: Determine PR URL
-        id: pr
-        shell: bash
-        run: |
-          echo "url=${{ github.event.pull_request.html_url || github.event.issue.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
-
-      - uses: F2iProject/vigil@v1
-        with:
-          pr-url: ${{ steps.pr.outputs.url }}
-          command: dismiss-resolved
-
-  resolve-addressed:
-    runs-on: ubuntu-latest
-    # Auto-resolve Vigil threads when code at commented lines changes
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.action == 'synchronize' &&
-      github.event.pull_request.draft == false
-    steps:
-      - uses: F2iProject/vigil@v1
-        with:
-          command: resolve-addressed
-          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+  vigil:
+    uses: ./.github/workflows/reusable-vigil.yml
+    with:
+      runner-json: '["self-hosted","linux","x64","ci-general"]'
+    secrets: inherit

@@ -4,6 +4,7 @@ import bisect
 import fnmatch
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 
 @dataclass
@@ -12,6 +13,39 @@ class FileHunk:
     path: str
     header: str  # the diff --git line + index/mode lines
     content: str  # the actual diff hunks
+
+
+# Repository-root convention files. These qualify as documentation ONLY when
+# they sit at the repository root: a root `README.md` is a project readme,
+# while `ai/admin/personal/README.md` is arbitrary content that happens to
+# share a name. Bare extension globs (`*.md`, `*.mdx`, `*.rst`, `*.txt`) are
+# deliberately absent — see is_documentation_path (F2iLLC/vigil#62).
+ROOT_DOC_FILE_GLOBS = (
+    "README",
+    "README.*",
+    "CHANGELOG",
+    "CHANGELOG.*",
+    "CONTRIBUTING",
+    "CONTRIBUTING.*",
+    "CODE_OF_CONDUCT",
+    "CODE_OF_CONDUCT.*",
+    "LICENSE",
+    "LICENSE.*",
+    "NOTICE",
+    "NOTICE.*",
+)
+
+DOC_PATH_PREFIXES = (
+    "docs/",
+    "documentation/",
+    ".github/ISSUE_TEMPLATE/",
+)
+
+DOC_PATH_GLOBS = (
+    ".github/pull_request_template.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/PULL_REQUEST_TEMPLATE/*.md",
+)
 
 
 def parse_diff(raw_diff: str) -> list[FileHunk]:
@@ -48,6 +82,55 @@ def parse_diff(raw_diff: str) -> list[FileHunk]:
         hunks.append(FileHunk(path=path, header=header, content=content))
 
     return hunks
+
+
+def is_documentation_path(path: str) -> bool:
+    """Return True when a changed file sits on a documentation surface.
+
+    Classification is by *path*, never by file extension alone. A file
+    qualifies only when it is under a recognized documentation directory
+    (``DOC_PATH_PREFIXES``), matches a recognized documentation path
+    (``DOC_PATH_GLOBS``), or is a repository-root convention file
+    (``ROOT_DOC_FILE_GLOBS``) *at the root itself*.
+
+    A bare ``*.md``/``*.mdx``/``*.rst``/``*.txt`` extension match at arbitrary
+    depth is explicitly NOT documentation. Markdown is the substrate for
+    governance policy, security procedure, runbooks, ADRs, and confidentiality
+    boundaries, none of which are low-risk by virtue of a file extension, so
+    ``ai/admin/personal/counsel.md`` and ``src/some/deep/path/notes.md`` are
+    ordinary changed files while ``docs/setup/install.md`` and a root
+    ``README.md`` are documentation (F2iLLC/vigil#62).
+    """
+    normalized = path.replace("\\", "/").lstrip("/")
+    if not normalized:
+        return False
+
+    if any(normalized.startswith(prefix) for prefix in DOC_PATH_PREFIXES):
+        return True
+    if any(fnmatch.fnmatch(normalized, pattern) for pattern in DOC_PATH_GLOBS):
+        return True
+    if "/" in normalized:
+        # Below the repository root only the path surfaces above qualify.
+        return False
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in ROOT_DOC_FILE_GLOBS)
+
+
+def is_documentation_only(hunks: list[FileHunk]) -> bool:
+    """Return True when every changed file sits on a documentation surface.
+
+    This is a classifier, NOT a review gate, and has no production caller.
+
+    It previously backed a short-circuit in ``review_diff`` that synthesized an
+    APPROVE verdict for every specialist and made zero model calls. That
+    short-circuit was removed in F2iLLC/vigil#62 after a "documentation-only"
+    PR committed confidential legal material and Vigil approved it green with
+    all six specialists reporting ``documentation_only: PASS``
+    (F2iLLC/LunaOS#4175). Documentation PRs now go down the normal specialist
+    and lead review path like any other diff.
+
+    Do not reintroduce this as a review-skipping gate without an owner ruling.
+    """
+    return bool(hunks) and all(is_documentation_path(hunk.path) for hunk in hunks)
 
 
 def filter_hunks(hunks: list[FileHunk], patterns: list[str]) -> list[FileHunk]:
@@ -215,7 +298,6 @@ def find_best_file_for_finding(
         return None
 
     # Try matching by basename
-    from pathlib import PurePosixPath
     finding_name = PurePosixPath(finding_file).name
     for path, lines in valid_lines.items():
         if PurePosixPath(path).name == finding_name and lines:

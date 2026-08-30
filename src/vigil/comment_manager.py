@@ -3,7 +3,7 @@
 import difflib
 import logging
 import re
-from collections import defaultdict
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -21,10 +21,11 @@ VIGIL_SESSION_PATTERN = re.compile(r"VGL-[0-9a-f]{6}")
 
 # Resolution reply detection
 _RESOLUTION_KEYWORDS = re.compile(
-    r"\b(resolved|fixed|addressed|done)\b", re.IGNORECASE
+    r"\b(resolved|fixed|addressed|done|over\s*ruled|overridden|wontfix|acceptable|follow[-\s]?up|tracked)\b",
+    re.IGNORECASE,
 )
-_ISSUE_LINK_PATTERN = re.compile(
-    r"https?://github\.com/([^/]+)/([^/]+)/issues/(\d+)"
+_TRACKING_LINK_PATTERN = re.compile(
+    r"https?://github\.com/([^/]+)/([^/]+)/(?:issues|pull)/(\d+)"
 )
 _SHORT_ISSUE_REF = re.compile(r"#(\d+)")
 _ISSUE_RELEVANCE_THRESHOLD = 0.25
@@ -80,13 +81,315 @@ def fetch_all_pr_comments(owner: str, repo: str, pr_number: int, token: str) -> 
     return _paginate(url, _github_headers(token))
 
 
+def fetch_pr_conversation_comments(owner: str, repo: str, pr_number: int, token: str) -> list[dict]:
+    """Fetch top-level PR conversation comments (the Conversation tab).
+
+    A pull request is a GitHub issue under the hood. Inline diff comments live
+    under /pulls/{n}/comments (see fetch_all_pr_comments); general discussion,
+    bot replies (e.g. a connector announcing it reviews PRs), and non-review
+    commentary live under /issues/{n}/comments instead. This is where a claim
+    made in the diff or PR body can be contradicted by something already said
+    in the thread.
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    return _paginate(url, _github_headers(token))
+
+
+def fetch_all_pr_reviews(owner: str, repo: str, pr_number: int, token: str) -> list[dict]:
+    """Fetch all PR reviews (not just Vigil's), for their summary bodies.
+
+    Prior review verdicts are also conversation evidence — a PR that reasserts
+    something a previous review already addressed should be checked against it.
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    return _paginate(url, _github_headers(token))
+
+
+_MAX_CONVERSATION_CHARS = 6000
+_MAX_CONVERSATION_ITEM_CHARS = 800
+
+
+def build_conversation_context(
+    comments: list[dict],
+    reviews: list[dict] | None = None,
+    max_total_chars: int = _MAX_CONVERSATION_CHARS,
+    max_item_chars: int = _MAX_CONVERSATION_ITEM_CHARS,
+    head_sha: str = "",
+) -> str:
+    """Format PR conversation comments + review summaries for specialist context.
+
+    Vigil's own output is excluded from **both** sources: a prior verdict is
+    generated evidence about an older head, not independent conversation.
+
+    Returns chronologically-ordered, truncated plain text — empty string if
+    there's nothing to show. Items are dropped (not further truncated) once
+    the total budget is exhausted, with a note of how many were omitted, so
+    the most recent thread activity is always preserved in favor of older
+    entries when a PR has an unusually long history.
+    """
+    # timestamp, author, body, kind, attributed commit.  Top-level comments
+    # are intentionally unattributed: their creation time does not prove what
+    # tree the author inspected.
+    items: list[tuple[str, str, str, str, str]] = []
+
+    for c in comments:
+        body = (c.get("body") or "").strip()
+        if not body:
+            continue
+        # Same exclusion as the reviews loop below, and for the same reason —
+        # it was missing here, which made the exclusion ineffective. When the
+        # PR Review API rejects every attempt, post_review falls back to
+        # posting the whole review body as an *issue* comment, and issue
+        # comments arrive through this loop. So Vigil's own prior findings
+        # re-entered the next round's prompt as "PR Conversation" evidence and
+        # could anchor a re-review on a defect a later commit removed
+        # (F2iLLC/vigil#74). A human reply that quotes the whole review
+        # verbatim, signature included, is excluded too; that is the safe
+        # direction, and a human's own words are only lost when they carry no
+        # text of their own.
+        if VIGIL_SIGNATURE in body:
+            continue
+        items.append((
+            c.get("created_at", ""),
+            c.get("user", {}).get("login", "unknown"),
+            body,
+            "human_comment",
+            "",
+        ))
+
+    for r in reviews or []:
+        body = (r.get("body") or "").strip()
+        if not body:
+            continue
+        # A prior Vigil verdict is generated evidence about an older head, not
+        # independent conversation evidence. Feeding it back into a re-review
+        # can anchor the model on findings that a later commit removed. Human
+        # reviews remain useful context; Vigil's own summaries are handled by
+        # the dedicated cross-round lifecycle instead.
+        if VIGIL_SIGNATURE in body:
+            continue
+        state = (r.get("state") or "").lower()
+        items.append((
+            r.get("submitted_at", ""),
+            r.get("user", {}).get("login", "unknown"),
+            body,
+            f"review:{state}" if state else "review",
+            r.get("commit_id") or "",
+        ))
+
+    if not items:
+        return ""
+
+    items.sort(key=lambda item: item[0])
+
+    # Fill the budget from most recent backwards, so a long thread keeps its
+    # latest activity (where a claim is most likely to have been contradicted
+    # or resolved) instead of losing it to older entries filling the quota.
+    kept: list[str] = []
+    total = 0
+    omitted = 0
+    for created_at, author, body, kind, evidence_commit in reversed(items):
+        if len(body) > max_item_chars:
+            body = body[:max_item_chars] + " …[truncated]"
+        attributable = bool(
+            head_sha and evidence_commit and evidence_commit.lower() == head_sha.lower()
+        )
+        commit_label = evidence_commit[:12] if evidence_commit else "unattributed"
+        entry = (
+            f"[vigil-evidence source={kind} commit={commit_label} "
+            f"current_head={'true' if attributable else 'false'}]\n"
+            f"**{author}** ({kind}, {created_at}):\n{body}"
+        )
+        if total + len(entry) > max_total_chars:
+            omitted += 1
+            continue
+        kept.append(entry)
+        total += len(entry)
+
+    entries = list(reversed(kept))
+    if omitted:
+        entries.insert(0, f"…[{omitted} earlier thread item(s) omitted for length]")
+
+    return "\n\n---\n\n".join(entries)
+
+
 def get_last_reviewed_sha(owner: str, repo: str, pr_number: int, token: str) -> str | None:
-    """Find the most recent Vigil review and return its commit SHA."""
+    """Find the most recent Vigil review and return its commit SHA.
+
+    NOTE: this deliberately ignores review ``state`` — a DISMISSED review is
+    returned exactly like a live one. That is why it cannot be the only input
+    to the re-review decision; see ``get_vigil_review_state`` (issue #49).
+    """
     reviews = fetch_vigil_reviews(owner, repo, pr_number, token)
     if not reviews:
         return None
     latest = sorted(reviews, key=lambda r: r.get("submitted_at", ""), reverse=True)[0]
     return latest.get("commit_id")
+
+
+# --- Review-state inspection (issue #49) ---------------------------------
+#
+# GitHub review states we care about:
+#   APPROVED           - a standing approval
+#   CHANGES_REQUESTED  - a standing block
+#   COMMENTED          - a non-verdict review (what Vigil degrades to when it
+#                        lacks the write access to APPROVE/REQUEST_CHANGES)
+#   DISMISSED          - a verdict that has been withdrawn, by a human or by
+#                        the branch rule `dismiss_stale_reviews_on_push`.
+#                        Still returned by the reviews API.
+VIGIL_BLOCK_STATE = "CHANGES_REQUESTED"
+
+# States that mean "Vigil has already said its piece about this exact commit
+# and does not need to say it again". A DISMISSED review is excluded because
+# it has been withdrawn — that is the praxislms#263 shape, where the gate
+# could not be reopened even though nothing live remained at head.
+# CHANGES_REQUESTED is excluded because a standing block is precisely the
+# thing Vigil must be able to reconsider — that is the bioqms-core#1472 shape.
+# COMMENTED IS included on purpose: on a repo with no VIGIL_REVIEW_TOKEN every
+# Vigil review degrades to COMMENT, and treating those as unsettled would
+# re-review on every PR event forever.
+_SETTLED_VERDICT_STATES = frozenset({"APPROVED", "COMMENTED"})
+
+
+def _review_state(review: dict) -> str:
+    """Normalized upper-case review state ('' when absent)."""
+    return (review.get("state") or "").strip().upper()
+
+
+def select_outstanding_vigil_blocks(reviews: list[dict]) -> list[dict]:
+    """Vigil reviews still standing as CHANGES_REQUESTED.
+
+    Pure. A review that was later dismissed comes back from the API with
+    state DISMISSED, so filtering on CHANGES_REQUESTED already excludes it.
+    """
+    return [r for r in reviews if _review_state(r) == VIGIL_BLOCK_STATE]
+
+
+def has_settled_vigil_verdict_at(reviews: list[dict], head_sha: str | None) -> bool:
+    """True when Vigil has a live, settled verdict on this exact commit.
+
+    "Settled" means APPROVED or COMMENTED (see ``_SETTLED_VERDICT_STATES``).
+    A DISMISSED review at head does not count, which is what lets a
+    dismissed-verdict head reopen the review gate.
+
+    When ``head_sha`` is unknown this returns True — the conservative answer,
+    because the caller uses it to decide whether to spend a review, and we
+    would rather skip than re-review the world on missing data.
+    """
+    if not head_sha:
+        return True
+    return any(
+        r.get("commit_id") == head_sha and _review_state(r) in _SETTLED_VERDICT_STATES
+        for r in reviews
+    )
+
+
+@dataclass(frozen=True)
+class VigilReviewState:
+    """Everything the re-review decision needs, from a single reviews fetch."""
+
+    last_reviewed_sha: str | None = None
+    outstanding_blocks: list[dict] = field(default_factory=list)
+    settled_verdict_at_head: bool = True
+
+
+def get_vigil_review_state(
+    owner: str, repo: str, pr_number: int, token: str, head_sha: str | None = None,
+) -> VigilReviewState:
+    """Fetch Vigil's reviews once and summarize them for the review gate.
+
+    Sibling of ``get_last_reviewed_sha`` (whose signature is unchanged because
+    other callers depend on it). This one keeps the review ``state`` that
+    ``get_last_reviewed_sha`` collapses away.
+    """
+    reviews = fetch_vigil_reviews(owner, repo, pr_number, token)
+    if not reviews:
+        return VigilReviewState()
+    latest = sorted(reviews, key=lambda r: r.get("submitted_at", ""), reverse=True)[0]
+    return VigilReviewState(
+        last_reviewed_sha=latest.get("commit_id"),
+        outstanding_blocks=select_outstanding_vigil_blocks(reviews),
+        settled_verdict_at_head=has_settled_vigil_verdict_at(reviews, head_sha),
+    )
+
+
+def _dismiss_review(
+    owner: str, repo: str, pr_number: int, review_id: int, message: str, token: str,
+) -> bool:
+    """Dismiss one PR review via the REST dismissal endpoint. Never raises.
+
+    This is the injectable seam for issue #48: tests patch this function to
+    exercise both the accepted and the rejected branch without network access,
+    the same way ``_paginate`` and ``_graphql`` are patched elsewhere.
+
+    OPEN QUESTION (issue #48): GitHub hides self-dismissal in the UI, and
+    whether the REST endpoint permits an identity to dismiss its own review is
+    UNVERIFIED — it has deliberately not been exercised against a live PR. If
+    runtime logs show 403/422 here, the fallback the issue proposes is to
+    perform the dismissal under a second identity (GITHUB_TOKEN rather than
+    VIGIL_REVIEW_TOKEN). That credential switch is NOT implemented here
+    because it is equally untested; adding it blind would trade one unverified
+    path for another. Until then this degrades safely: log and carry on, so a
+    rejected dismissal costs a stale block, never an unguarded PR.
+    """
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}"
+        f"/pulls/{pr_number}/reviews/{review_id}/dismissals"
+    )
+    try:
+        resp = httpx.put(
+            url,
+            headers=_github_headers(token),
+            json={"message": message, "event": "DISMISS"},
+            timeout=30,
+        )
+    except Exception as e:  # network error, timeout, DNS, ...
+        log.warning("Dismissal request for review %s failed: %s", review_id, e)
+        return False
+
+    if resp.status_code >= 400:
+        # No retry: a 403/422 here is a permission verdict, not a blip, and a
+        # retry storm against a merge-gating control is worse than a stale block.
+        log.warning(
+            "GitHub rejected dismissal of review %s: %s %s",
+            review_id, resp.status_code, (resp.text or "")[:300],
+        )
+        return False
+
+    log.info("Dismissed stale Vigil block (review %s)", review_id)
+    return True
+
+
+def dismiss_stale_vigil_blocks(
+    owner: str, repo: str, pr_number: int, token: str, message: str,
+    reviews: list[dict] | None = None,
+) -> list[int]:
+    """Withdraw every Vigil review still standing as CHANGES_REQUESTED.
+
+    Returns the ids actually dismissed. Never raises — the caller has just put
+    a replacement verdict on record and must not fail the review because the
+    cleanup did not take.
+
+    Callers MUST have posted a genuine replacement approval first; see the
+    guards at the call site in cli.py (issue #48).
+    """
+    try:
+        candidates = (
+            reviews if reviews is not None
+            else fetch_vigil_reviews(owner, repo, pr_number, token)
+        )
+    except Exception as e:
+        log.warning("Could not fetch Vigil reviews to dismiss stale blocks: %s", e)
+        return []
+
+    dismissed: list[int] = []
+    for review in select_outstanding_vigil_blocks(candidates):
+        review_id = review.get("id")
+        if review_id is None:
+            continue
+        if _dismiss_review(owner, repo, pr_number, review_id, message, token):
+            dismissed.append(review_id)
+    return dismissed
 
 
 def _graphql(query: str, variables: dict, token: str) -> dict:
@@ -109,7 +412,7 @@ def fetch_review_threads(
 ) -> list[dict]:
     """Fetch review threads via GraphQL with path, line, body, and resolution status.
 
-    Returns list of dicts: {id, isResolved, path, line, body}
+    Returns list of dicts: {id, isResolved, path, line, body, comments}
     """
     query = """
     query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
@@ -120,11 +423,15 @@ def fetch_review_threads(
             nodes {
               id
               isResolved
-              comments(first: 1) {
+              comments(first: 20) {
                 nodes {
+                  id
                   body
                   path
                   line
+                  author {
+                    login
+                  }
                 }
               }
             }
@@ -141,13 +448,15 @@ def fetch_review_threads(
         pr_data = data.get("data", {}).get("repository", {}).get("pullRequest", {})
         thread_data = pr_data.get("reviewThreads", {})
         for node in thread_data.get("nodes", []):
-            first_comment = (node.get("comments", {}).get("nodes") or [{}])[0]
+            comments = node.get("comments", {}).get("nodes") or []
+            first_comment = (comments or [{}])[0]
             threads.append({
                 "id": node["id"],
                 "isResolved": node["isResolved"],
                 "path": first_comment.get("path"),
                 "line": first_comment.get("line"),
                 "body": first_comment.get("body", ""),
+                "comments": comments,
             })
         page_info = thread_data.get("pageInfo", {})
         if page_info.get("hasNextPage"):
@@ -206,6 +515,24 @@ def resolve_threads_batch(thread_ids: list[str], token: str) -> list[str]:
     return resolved
 
 
+def _thread_has_addressing_reply(thread: dict) -> bool:
+    """Return true when a Vigil thread has at least one non-empty reply."""
+    comments = thread.get("comments") or []
+    if len(comments) < 2:
+        return False
+
+    root_author = ((comments[0].get("author") or {}).get("login") or "").lower()
+    for reply in comments[1:]:
+        body = (reply.get("body") or "").strip()
+        if not body:
+            continue
+        author = ((reply.get("author") or {}).get("login") or "").lower()
+        if author and root_author and author == root_author:
+            continue
+        return True
+    return False
+
+
 def resolve_addressed_threads(
     owner: str, repo: str, pr_number: int, token: str,
     changed_files: dict[str, set[int]],
@@ -215,7 +542,9 @@ def resolve_addressed_threads(
     A thread is considered 'addressed' if:
       - It's a Vigil thread (body contains VGL session ID)
       - It's not already resolved
-      - Its file is in changed_files AND its line is in the changed lines set
+      - Its file is in changed_files AND either:
+        - its line is in the changed lines set, or
+        - someone replied in the thread and the same file changed
 
     Returns count of resolved threads.
     """
@@ -232,7 +561,9 @@ def resolve_addressed_threads(
         line = t.get("line")
         if path and path in changed_files:
             file_lines = changed_files[path]
-            if line is None or line in file_lines:
+            line_changed = line is None or line in file_lines
+            file_changed_with_reply = bool(file_lines) and _thread_has_addressing_reply(t)
+            if line_changed or file_changed_with_reply:
                 to_resolve.append(t["id"])
 
     if not to_resolve:
@@ -241,6 +572,59 @@ def resolve_addressed_threads(
     resolved = resolve_threads_batch(to_resolve, token)
     for tid in resolved:
         log.info("Resolved addressed thread %s", tid)
+    return len(resolved)
+
+
+def resolve_vigil_threads_on_approval(
+    owner: str, repo: str, pr_number: int, token: str,
+) -> int:
+    """Resolve every still-open Vigil thread on a PR Vigil has just approved.
+
+    Decision-driven, not diff-driven — and that is the whole point. Its sibling
+    `resolve_addressed_threads` only ever considers threads whose file appears
+    in the incremental diff since the last review, so a thread opened in an
+    earlier round on a file that later rounds never touch is never revisited.
+    Cross-round dedup then suppresses re-posting the same finding, so nothing
+    re-touches the thread either. The PR is left carrying an unresolved Vigil
+    thread underneath an approving Vigil review, indefinitely — a merge blocker
+    attached to a review that approved the PR, under any "resolve all threads
+    before merge" ruleset (issue #61).
+
+    Scope is ALL of Vigil's own unresolved threads on the PR, deliberately NOT
+    only the current session's. `session_id` is per-SPECIALIST-RUN, not
+    per-review-round (models.py: `PersonaVerdict.session_id`), so threads left
+    over from earlier rounds necessarily carry different session IDs. A
+    current-session-only implementation would therefore resolve nothing in
+    exactly the reported scenario — it would pass its own tests and not fix the
+    reported behavior.
+
+    Vigil's own threads are identified the way the rest of this module
+    identifies them: the `VGL-` marker in the thread body
+    (`VIGIL_SESSION_PATTERN`). That gate is what guarantees human-authored
+    threads are never touched.
+
+    Callers MUST have put a genuine accepted approval on record first; see the
+    guards at the call site in cli.py (issue #61).
+
+    Returns count of resolved threads.
+    """
+    threads = fetch_review_threads(owner, repo, pr_number, token)
+
+    to_resolve: list[str] = []
+    for t in threads:
+        if t["isResolved"]:
+            continue
+        # The VGL gate is the human-thread guard. Never widen it.
+        if not VIGIL_SESSION_PATTERN.search(t.get("body", "")):
+            continue
+        to_resolve.append(t["id"])
+
+    if not to_resolve:
+        return 0
+
+    resolved = resolve_threads_batch(to_resolve, token)
+    for tid in resolved:
+        log.info("Resolved Vigil thread %s on approval", tid)
     return len(resolved)
 
 
@@ -253,7 +637,7 @@ def _is_resolution_reply(body: str) -> bool:
     if _RESOLUTION_KEYWORDS.search(body):
         return True
     # Issue link (full URL or short ref like #45)
-    if _ISSUE_LINK_PATTERN.search(body) or _SHORT_ISSUE_REF.search(body):
+    if _TRACKING_LINK_PATTERN.search(body) or _SHORT_ISSUE_REF.search(body):
         return True
     return False
 
@@ -269,7 +653,7 @@ def _extract_issue_refs(body: str) -> list[tuple[str, str, int]]:
 
     # Full URL matches — track their spans so we don't double-count short refs inside them
     full_url_spans: list[tuple[int, int]] = []
-    for match in _ISSUE_LINK_PATTERN.finditer(body):
+    for match in _TRACKING_LINK_PATTERN.finditer(body):
         owner, repo, num = match.group(1), match.group(2), int(match.group(3))
         results.append((owner, repo, num))
         full_url_spans.append((match.start(), match.end()))
@@ -460,7 +844,13 @@ def resolve_dismissed_threads(
                 # Infer decision type from the reply text
                 reason = info.get("reason", "")
                 reason_lower = reason.lower()
-                if "false positive" in reason_lower or "false_positive" in reason_lower:
+                if (
+                    "false positive" in reason_lower
+                    or "false_positive" in reason_lower
+                    or "overruled" in reason_lower
+                    or "over ruled" in reason_lower
+                    or "overridden" in reason_lower
+                ):
                     decision_type = "false_positive"
                 elif "wontfix" in reason_lower or "won't fix" in reason_lower or "acceptable" in reason_lower:
                     decision_type = "wontfix"
@@ -573,10 +963,9 @@ def is_duplicate_finding(
 ) -> bool:
     """Check if a new inline comment duplicates an existing Vigil comment.
 
-    Match criteria (ALL must be true):
-    1. Same file path
-    2. Same line (or within 3 lines)
-    3. Message similarity >= threshold
+    Structured comments first match by a stable semantic finding key that is
+    independent of category, line, and presentation anchor. Legacy comments
+    retain the old path/line/text fallback.
     """
     new_path = new_comment.get("path", "")
     new_line = new_comment.get("line", 0)
@@ -585,10 +974,22 @@ def is_duplicate_finding(
     if not new_text:
         return False
 
+    from .context_manager import extract_finding_from_comment, stable_finding_key
+
+    new_finding = extract_finding_from_comment(
+        new_comment.get("body", ""), new_path, new_line,
+    )
+    new_key = stable_finding_key(new_finding) if new_finding else ""
+
     for existing in existing_comments:
+        existing_line = existing.get("line") or existing.get("original_line") or 0
+        existing_finding = extract_finding_from_comment(
+            existing.get("body", ""), existing.get("path"), existing_line,
+        )
+        if new_key and existing_finding and new_key == stable_finding_key(existing_finding):
+            return True
         if existing.get("path") != new_path:
             continue
-        existing_line = existing.get("line") or existing.get("original_line") or 0
         if abs(existing_line - new_line) > 3:
             continue
         existing_text = _extract_message_content(existing.get("body", ""))
@@ -624,18 +1025,9 @@ def deduplicate_comments(
     if not existing_comments:
         return list(new_comments)
 
-    # Index existing comments by path for O(1) lookup
-    by_path: dict[str, list[dict]] = defaultdict(list)
-    for c in existing_comments:
-        path = c.get("path", "")
-        if path:
-            by_path[path].append(c)
-
     result = []
     for c in new_comments:
-        path = c.get("path", "")
-        candidates = by_path.get(path, [])
-        if not candidates or not is_duplicate_finding(c, candidates, threshold):
+        if not is_duplicate_finding(c, existing_comments, threshold):
             result.append(c)
     return result
 

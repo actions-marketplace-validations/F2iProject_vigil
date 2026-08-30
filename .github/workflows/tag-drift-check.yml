@@ -1,0 +1,121 @@
+# Detect release-pin drift (issue #58). REPORT ONLY — never mutates a tag.
+#
+# The release decision is the owner's, so this workflow does not ship anything.
+# What it removes is the *silence*: the drift in issue #58 was found four times
+# by a human reading SHAs by hand, and each time it had already been live for
+# hours. A scheduled check turns that into a signal that arrives on its own.
+#
+# It watches BOTH stale surfaces the issue identifies, because fixing only the
+# first leaves the second rotting:
+#   1. the `v1` alias tag vs `main`
+#   2. the `F2iLLC/vigil@<sha>` self-pins inside .github/workflows/
+#
+# It does not run on `pull_request`, so it can never block a PR — and it is
+# expected to be RED right now, because the drift it reports is real.
+
+name: Tag drift check
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily. Clears itself the moment a release is cut; until then it is a
+    # standing reminder rather than a one-time notification that scrolls away.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vigil-tag-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: v1 alias and self-pins vs main
+    runs-on: ${{ fromJSON(vars.VIGIL_RUNNER_JSON || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags and full history are both required: without them the alias
+          # cannot be peeled and the commit counts are meaningless.
+          fetch-depth: 0
+
+      - name: Ensure main and tags are present
+        # A missing tag would read as "alias missing" and a missing
+        # `origin/main` as an unresolvable branch — both are reported, but
+        # fetching explicitly keeps the check measuring drift rather than
+        # measuring its own checkout.
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin +refs/heads/main:refs/remotes/origin/main
+          git rev-parse --verify 'origin/main^{commit}' >/dev/null
+
+      - name: Check the v1 alias against main
+        id: alias
+        run: |
+          set -uo pipefail
+          out="$(bash .github/scripts/tagctl.sh drift --alias v1 --branch origin/main)"; rc=$?
+          printf '%s\n' "$out"
+
+          {
+            echo "## Release pin drift"
+            echo ""
+            echo "### \`v1\` alias"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "\`v1\` is in sync with \`main\`." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$rc" -eq 4 ]; then
+            echo "::error::the v1 alias tag does not exist"
+            echo "\`v1\` is **missing**." >> "$GITHUB_STEP_SUMMARY"
+          else
+            count="$(printf '%s\n' "$out" | sed -n 's/^drift_count=//p')"
+            echo "::warning::v1 is ${count} commit(s) behind main — merged fixes are not reaching consumers"
+            {
+              echo "\`v1\` is **${count} commit(s) behind \`main\`**. Every consumer"
+              echo "pinning \`F2iLLC/vigil@v1\` is running without these:"
+              echo ""
+              echo '```'
+              printf '%s\n' "$out" | sed -n '/^unshipped<<EOF_UNSHIPPED$/,/^EOF_UNSHIPPED$/p' \
+                | sed '1d;$d'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Check the in-repo self-pins against main
+        id: pins
+        run: |
+          set -uo pipefail
+          out="$(bash .github/scripts/tagctl.sh pins --branch origin/main)"; rc=$?
+          printf '%s\n' "$out"
+
+          {
+            echo ""
+            echo "### \`F2iLLC/vigil@<sha>\` self-pins"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "All self-pins are current." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::stale F2iLLC/vigil self-pins in .github/workflows/"
+            {
+              echo "Stale pins found. These do **not** follow the \`v1\` alias, so"
+              echo "releasing \`v1\` does not refresh them:"
+              echo ""
+              echo '| file | pin | state |'
+              echo '|---|---|---|'
+              printf '%s\n' "$out" | awk -F'\t' '$1=="pin"{printf "| `%s` | `%s` | %s |\n", $2, $3, $4}'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if either surface has drifted
+        if: steps.alias.outputs.rc != '0' || steps.pins.outputs.rc != '0'
+        run: |
+          echo "::error::release pins have drifted — see the job summary"
+          exit 1

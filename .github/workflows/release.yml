@@ -1,0 +1,225 @@
+# Vigil release — move the consumer-facing major alias tag (issue #58).
+#
+# WHAT THIS DELIBERATELY DOES NOT DO
+# ----------------------------------
+# It does NOT trigger on `push: branches: [main]`.
+#
+# Issue #58's suggested guard was "on push to main, force-move v1 to the new
+# head". That is the convention `actions/checkout` uses, and it is a
+# reasonable default *for a repo with CI*. This repo has none: `vigil.yml`
+# (its self-review workflow) is `disabled_manually` and last ran 2026-03-14,
+# so PRs here merge with zero checks and zero automated review. Auto-shipping
+# every merge from an unreviewed branch straight to five consumer repos --- one
+# of which is the reviewer gating all the others --- converts a *visible*
+# staleness problem into an *invisible* blast-radius problem. Drift that is
+# noticed on a heartbeat is recoverable; a bad auto-ship to the fleet's own
+# reviewer is not.
+#
+# So the release stays an explicit human act, and this workflow makes that act
+# one step instead of a remembered checklist:
+#
+#   * push a semver tag (v1.2.0)  -> the matching major alias (v1) follows it
+#   * or run it by hand           -> workflow_dispatch, dry-run by default
+#
+# Tying the alias to a semver tag also closes a gap the issue does not state:
+# there is currently NO semver tag anyone can pin to for the commits on main,
+# and `v1` itself already sits ahead of `v1.1.0`. Cutting the numbered release
+# and moving the alias in one operation makes "v1 == the newest semver tag" an
+# invariant with a real audit trail, instead of two steps that drift apart.
+#
+# OWNER SETUP REQUIRED — read before relying on the gate:
+#   Create a repository environment named `release` and add yourself as a
+#   required reviewer. GitHub auto-creates a fully UNPROTECTED environment
+#   on first use, so until you do this the approval gate is cosmetic and
+#   anyone who can push a tag can ship to the fleet.
+
+name: Release (move major alias tag)
+
+on:
+  push:
+    tags:
+      # Semver releases only. Deliberately does not match the alias itself
+      # (`v1`), so re-pushing the alias can never re-enter this workflow.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Ref to point the alias at (must be contained in main)"
+        required: false
+        default: "main"
+      alias:
+        description: "Alias tag to move"
+        required: false
+        default: "v1"
+      dry_run:
+        description: "Validate only; do not move or push the alias"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # One release at a time. A second run must not race the first to force-push
+  # the same alias.
+  group: vigil-release-alias
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify the proposed alias move
+    runs-on: ${{ fromJSON(vars.VIGIL_RUNNER_JSON || '["ubuntu-latest"]') }}
+    outputs:
+      alias: ${{ steps.plan.outputs.alias }}
+      target_commit: ${{ steps.plan.outputs.target_commit }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: the alias peel, the ancestry guard and the
+          # action.yml diff all need real history, and a shallow clone makes
+          # `merge-base --is-ancestor` quietly wrong.
+          fetch-depth: 0
+
+      - name: Ensure main and tags are present
+        # Do not rely on checkout's refspec internals for this. Every guard
+        # below is expressed against `origin/main` and against the existing
+        # alias tag; if either is absent the ancestry check does not fail
+        # loudly, it silently has nothing to compare and the release proceeds
+        # on a false premise. With no CI in this repo to catch that, fetch
+        # them explicitly.
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin +refs/heads/main:refs/remotes/origin/main
+          git rev-parse --verify 'origin/main^{commit}' >/dev/null
+
+      - name: Resolve what is being released
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_TARGET: ${{ inputs.target }}
+          IN_ALIAS: ${{ inputs.alias }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          tagctl=.github/scripts/tagctl.sh
+
+          if [ "$EVENT" = "push" ]; then
+            # A semver tag was pushed: the alias is its major component.
+            target="$REF_NAME"
+            case "$REF_NAME" in
+              v*.*.*) alias="${REF_NAME%%.*}" ;;
+              *) echo "::error::unexpected tag $REF_NAME"; exit 1 ;;
+            esac
+            dry_run=false
+          else
+            target="${IN_TARGET:-main}"
+            alias="${IN_ALIAS:-v1}"
+            dry_run="${IN_DRY_RUN:-true}"
+          fi
+
+          echo "alias=$alias"   >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+
+          # plan-move enforces: target resolves, target is contained in main,
+          # and the alias is not being silently rolled backwards. It prints
+          # the resolved COMMIT (annotated tags peeled) and mutates nothing.
+          target_commit="$(bash "$tagctl" plan-move "$alias" "$target" --branch origin/main)"
+          echo "target_commit=$target_commit" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Proposed release"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| alias | \`$alias\` |"
+            echo "| target ref | \`$target\` |"
+            echo "| target commit | \`$target_commit\` |"
+            echo "| dry run | \`$dry_run\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Test suite must pass before anything ships
+        # Issue #58, constraint 1: "an automated retag with no test gate would
+        # be strictly worse than the manual process it replaces." Both manual
+        # retags were gated on a local pytest run; this is that gate, in CI.
+        run: pytest -q
+
+      - name: action.yml inputs must stay compatible for consumers
+        # Issue #58, constraint 2. A removed or newly-required input does not
+        # fail consumer workflows loudly — it is ignored — so the break would
+        # surface as Vigil quietly not honouring settings across the fleet.
+        run: |
+          set -euo pipefail
+          python .github/scripts/check_action_inputs.py \
+            --from "${{ steps.plan.outputs.alias }}" \
+            --to   "${{ steps.plan.outputs.target_commit }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Move and push the alias
+    needs: verify
+    if: needs.verify.outputs.dry_run != 'true'
+    runs-on: ${{ fromJSON(vars.VIGIL_RUNNER_JSON || '["ubuntu-latest"]') }}
+    # The human gate. Configure required reviewers on this environment or it
+    # provides no protection at all — see the header note.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure main and tags are present
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin +refs/heads/main:refs/remotes/origin/main
+          git rev-parse --verify 'origin/main^{commit}' >/dev/null
+
+      - name: Move the alias
+        env:
+          ALIAS: ${{ needs.verify.outputs.alias }}
+          TARGET_COMMIT: ${{ needs.verify.outputs.target_commit }}
+        run: |
+          set -euo pipefail
+          # An annotated tag needs a tagger identity; without this `git tag -a`
+          # fails outright. (A test caught this before CI ever ran.)
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Re-validate on this runner rather than trusting the upstream job's
+          # output: `publish` may sit in the approval queue for a long time and
+          # main can move underneath it.
+          bash .github/scripts/tagctl.sh plan-move "$ALIAS" "$TARGET_COMMIT" --branch origin/main
+          bash .github/scripts/tagctl.sh move "$ALIAS" "$TARGET_COMMIT" \
+            --message "$ALIAS -> $TARGET_COMMIT (released by ${GITHUB_WORKFLOW} run ${GITHUB_RUN_ID})"
+
+          git push --force origin "refs/tags/${ALIAS}"
+
+          echo "### Released" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$ALIAS\` now points at \`$TARGET_COMMIT\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm the alias landed where intended
+        env:
+          ALIAS: ${{ needs.verify.outputs.alias }}
+          TARGET_COMMIT: ${{ needs.verify.outputs.target_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${ALIAS}:refs/tags/${ALIAS}"
+          landed="$(bash .github/scripts/tagctl.sh resolve "$ALIAS")"
+          if [ "$landed" != "$TARGET_COMMIT" ]; then
+            echo "::error::$ALIAS resolved to $landed, expected $TARGET_COMMIT"
+            exit 1
+          fi
+          echo "verified: $ALIAS = $landed"

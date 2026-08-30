@@ -50,8 +50,8 @@ def merge_specialist_findings(
 ) -> tuple[list[Finding], list[MergedFinding]]:
     """Merge findings from multiple specialists, grouping overlapping issues.
 
-    When specialists flag the same issue (same file, line, category, message),
-    they're merged into a single Finding with specialist attribution.
+    When specialists flag the same affected component and defect predicate,
+    they're merged even if wording, category, line, or anchor differs.
 
     Args:
         verdicts: List of PersonaVerdict objects from specialists
@@ -70,7 +70,7 @@ def merge_specialist_findings(
     if not specialist_findings:
         return [], []
 
-    # Group by fingerprint
+    # Group by the stable semantic identity shared with cross-round/issue dedup.
     groups = find_cross_specialist_duplicates(
         [(name, finding) for name, finding, _ in specialist_findings]
     )

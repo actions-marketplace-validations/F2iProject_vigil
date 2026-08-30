@@ -4,12 +4,18 @@ Centralizes common functions to avoid duplication and circular imports:
 - Text processing (message extraction, fingerprinting, formatting stripping)
 - GitHub API helpers (headers)
 - Severity emoji mapping
+- Not-reviewed labelling for specialists that never ran
 """
 
 import hashlib
 import re
 
-from .models import Severity
+from .models import (
+    SKIP_NO_EXTERNAL_CONTEXT,
+    SKIP_NO_FILES_IN_SCOPE,
+    SKIP_REVIEWER_UNAVAILABLE,
+    Severity,
+)
 
 # ---------- GitHub API ----------
 
@@ -34,6 +40,46 @@ SEVERITY_EMOJI: dict[Severity, str] = {
 def severity_emoji(sev: Severity) -> str:
     """Return the emoji for a severity level."""
     return SEVERITY_EMOJI.get(sev, "")
+
+
+# ---------- Specialists that never ran (F2iLLC/vigil#66) ----------
+
+# One marker and one phrasing for a specialist that made no model call, so
+# every surface that reports one says the same thing. Deliberately NOT a
+# check-mark and deliberately never the word APPROVE: the whole defect is
+# that these rendered indistinguishably from a specialist that read the diff
+# and found nothing.
+NOT_REVIEWED_ICON = "\u23ed\ufe0f"  # skip marker (never a check-mark)
+NOT_REVIEWED_LABEL = "NOT REVIEWED"
+
+NOT_REVIEWED_REASON_TEXT: dict[str, str] = {
+    SKIP_NO_FILES_IN_SCOPE: "no files in scope",
+    SKIP_REVIEWER_UNAVAILABLE: "reviewer unavailable",
+    SKIP_NO_EXTERNAL_CONTEXT: "no governing spec supplied",
+}
+
+
+def not_reviewed_reason_text(skip_reason: str = "") -> str:
+    """Return the bare reason phrase for a skip, or "" if it is unrecognized.
+
+    Split out from ``not_reviewed_label`` so a surface that already has its
+    own label column — the CLI's live specialist line — can put the reason
+    where it belongs without re-deriving it from a different map. One map,
+    one vocabulary, every surface in lockstep.
+    """
+    return NOT_REVIEWED_REASON_TEXT.get(skip_reason, "")
+
+
+def not_reviewed_label(skip_reason: str = "") -> str:
+    """Render a PersonaVerdict.skip_reason as display text.
+
+    An unrecognized or missing reason degrades to the bare label rather than
+    guessing. That is still honest — "NOT REVIEWED" alone already says the
+    only thing a reader must not get wrong — and it means a future skip
+    reason cannot accidentally render as a completed review.
+    """
+    detail = not_reviewed_reason_text(skip_reason)
+    return f"{NOT_REVIEWED_LABEL} — {detail}" if detail else NOT_REVIEWED_LABEL
 
 
 # ---------- Text processing ----------

@@ -5,6 +5,8 @@ import pytest
 from vigil.diff_parser import (
     commentable_lines,
     find_best_file_for_finding,
+    is_documentation_only,
+    is_documentation_path,
     nearest_commentable_line,
     parse_diff,
 )
@@ -154,3 +156,100 @@ class TestCommentableLinesIntegration:
         # A line NOT in the diff — should snap to nearest
         result = nearest_commentable_line("src/app.py", 20, valid)
         assert result is not None
+
+
+class TestDocumentationOnlyDetection:
+
+    def test_documentation_paths_are_documentation(self):
+        assert is_documentation_path("docs/setup/install.md")
+        assert is_documentation_path("documentation/guide.rst")
+        assert is_documentation_path(".github/ISSUE_TEMPLATE/bug.md")
+        assert is_documentation_path(".github/PULL_REQUEST_TEMPLATE/release.md")
+        assert is_documentation_path(".github/pull_request_template.md")
+
+    def test_root_convention_files_are_documentation(self):
+        assert is_documentation_path("README.md")
+        assert is_documentation_path("README")
+        assert is_documentation_path("CHANGELOG.md")
+        assert is_documentation_path("CONTRIBUTING.md")
+        assert is_documentation_path("CODE_OF_CONDUCT.md")
+        assert is_documentation_path("LICENSE")
+        assert is_documentation_path("NOTICE.txt")
+
+    def test_runtime_path_is_not_documentation(self):
+        assert not is_documentation_path("src/app.py")
+        assert not is_documentation_path("packages/core/src/index.ts")
+
+    def test_markdown_outside_a_documentation_path_is_not_documentation(self):
+        """A bare extension match at arbitrary depth must not qualify (#62).
+
+        Markdown carries governance policy, security procedure, and
+        confidentiality boundaries. `ai/admin/personal/` is the real path from
+        F2iLLC/LunaOS#4175, where confidential legal material shipped under a
+        "documentation-only" approval.
+        """
+        assert not is_documentation_path("ai/admin/personal/counsel.md")
+        assert not is_documentation_path("src/some/deep/path/notes.md")
+        assert not is_documentation_path("ai/admin/personal/board.mdx")
+        assert not is_documentation_path("policy/security-procedure.rst")
+        assert not is_documentation_path("config/secrets.txt")
+
+    def test_root_convention_names_do_not_qualify_at_depth(self):
+        """`README*` is a root convention, not a name that travels (#62)."""
+        assert not is_documentation_path("ai/admin/personal/README.md")
+        assert not is_documentation_path("packages/core/CHANGELOG.md")
+        assert not is_documentation_path("vendor/dep/LICENSE")
+
+    def test_all_documentation_hunks_are_documentation_only(self):
+        diff = """\
+diff --git a/README.md b/README.md
+index 1111111..2222222 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ # Vigil
++More docs
+diff --git a/docs/setup.md b/docs/setup.md
+index 1111111..2222222 100644
+--- a/docs/setup.md
++++ b/docs/setup.md
+@@ -1 +1,2 @@
+ # Setup
++Install steps
+"""
+        assert is_documentation_only(parse_diff(diff))
+
+    def test_mixed_hunks_are_not_documentation_only(self):
+        diff = """\
+diff --git a/README.md b/README.md
+index 1111111..2222222 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ # Vigil
++More docs
+diff --git a/src/app.py b/src/app.py
+index 1111111..2222222 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1,2 @@
+ print("hi")
++print("bye")
+"""
+        assert not is_documentation_only(parse_diff(diff))
+
+    def test_markdown_outside_docs_paths_is_not_documentation_only(self):
+        """The F2iLLC/LunaOS#4175 diff shape: all-Markdown, no docs path (#62)."""
+        diff = """\
+diff --git a/ai/admin/personal/counsel.md b/ai/admin/personal/counsel.md
+index 1111111..2222222 100644
+--- a/ai/admin/personal/counsel.md
++++ b/ai/admin/personal/counsel.md
+@@ -1 +1,2 @@
+ # Counsel
++Named counsel and per-firm decline reasons
+"""
+        assert not is_documentation_only(parse_diff(diff))
+
+    def test_empty_diff_is_not_documentation_only(self):
+        assert not is_documentation_only([])
